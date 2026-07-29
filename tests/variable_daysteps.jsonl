@@ -1,0 +1,5 @@
+{"map":{"width":8,"height":8,"cells":[[0,0,0,0,0,0,0,0],[0,0,0,0,0,0,0,0],[0,0,1,1,1,0,0,0],[0,0,0,3,0,0,0,0],[0,0,0,0,2,0,0,0],[0,0,0,0,0,0,0,0],[0,0,0,0,0,0,0,0],[0,0,0,0,0,0,0,0]]},"spots":[{"pos":5,"brand":0,"stocks":3},{"pos":18,"brand":1,"stocks":4},{"pos":36,"brand":2,"stocks":2},{"pos":58,"brand":3,"stocks":5}],"daySteps":[40,80,55,100],"agents":[{"pos":0},{"pos":7},{"pos":56},{"pos":63}]}
+{"day":0,"traffics":[{"pos":18,"status":1}],"agents":[{"kind":0,"pos":0,"fuel":90},{"kind":0,"pos":7,"fuel":90},{"kind":0,"pos":56,"fuel":90},{"kind":1,"pos":63,"fuel":999}]}
+{"day":1,"traffics":[{"pos":18,"status":2},{"pos":19,"status":1}],"agents":[{"kind":0,"pos":5,"fuel":80},{"kind":0,"pos":18,"fuel":78},{"kind":0,"pos":58,"fuel":82},{"kind":1,"pos":60,"fuel":999}]}
+{"day":2,"traffics":[],"agents":[{"kind":0,"pos":10,"fuel":70},{"kind":0,"pos":20,"fuel":68},{"kind":0,"pos":50,"fuel":72},{"kind":1,"pos":44,"fuel":999}]}
+{"day":3,"traffics":[{"pos":18,"status":1}],"agents":[{"kind":0,"pos":0,"fuel":90},{"kind":0,"pos":7,"fuel":90},{"kind":0,"pos":56,"fuel":90},{"kind":1,"pos":63,"fuel":999}]}

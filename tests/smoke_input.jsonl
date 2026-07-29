@@ -1,0 +1,2 @@
+{"map":{"width":4,"height":3,"cells":[[0,0,0,0],[0,3,1,0],[0,0,2,0]]},"spots":[{"pos":2,"brand":10,"amount":3},{"pos":8,"brand":11,"amount":2},{"pos":11,"brand":10,"amount":5}],"daySteps":[8],"agents":[{"pos":0},{"pos":3},{"pos":9}]}
+{"day":0,"traffics":[{"pos":6,"status":2}],"agents":[{"kind":0,"pos":0,"fuel":10},{"kind":0,"pos":3,"fuel":10},{"kind":1,"pos":9,"fuel":999}]}
