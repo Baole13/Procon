@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 import argparse
+import hashlib
 import json
 import os
+import random
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
+from enum import Enum
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -90,18 +93,153 @@ def bot_environment():
     return env
 
 
+class HttpPhase(Enum):
+    WAIT_SETUP = "WAIT_SETUP"
+    WAIT_START = "WAIT_START"
+    ACTIVE_DAY = "ACTIVE_DAY"
+    AFTER_VALID_ACTION = "AFTER_VALID_ACTION"
+    FINISHED = "FINISHED"
+
+
+class LeaderLock:
+    def __init__(self, match_id, token, log_path):
+        token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()[:12]
+        self.path = Path("matches") / f".leader-{match_id}-{token_hash}.lock"
+        self.log_path = log_path
+        self.fd = None
+        self.owns_lock = False
+
+    def acquire(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self.fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(self.fd, f"pid={os.getpid()} started={time.time()}\n".encode("ascii"))
+            self.owns_lock = True
+            write_log(self.log_path, f"leader_lock acquired=1 path={self.path}")
+            return True
+        except FileExistsError:
+            owner = ""
+            try:
+                owner = self.path.read_text(encoding="utf-8", errors="replace").strip()
+            except Exception:
+                pass
+            write_log(self.log_path, f"leader_lock acquired=0 path={self.path} owner={owner}")
+            return False
+
+    def release(self):
+        owned = self.owns_lock
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = None
+        self.owns_lock = False
+        if owned:
+            try:
+                self.path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+class RequestLimiter:
+    def __init__(self, min_interval_ms, log_path):
+        self.min_interval = max(0, min_interval_ms) / 1000.0
+        self.log_path = log_path
+        self.last_request_started = 0.0
+
+    def wait(self, phase, method, path):
+        now = time.perf_counter()
+        wait_seconds = max(0.0, self.last_request_started + self.min_interval - now)
+        wait_ms = int(wait_seconds * 1000)
+        if wait_ms > 0:
+            write_log(self.log_path, f"rate_limit phase={phase.value} method={method} path={path} rate_wait_ms={wait_ms}")
+            time.sleep(wait_seconds)
+        self.last_request_started = time.perf_counter()
+
+
+class BackoffPolicy:
+    def __init__(self):
+        self.handover_attempts = 0
+        self.timeout_attempts = 0
+        self.not_ready_attempts = 0
+
+    def reset(self):
+        self.handover_attempts = 0
+        self.timeout_attempts = 0
+        self.not_ready_attempts = 0
+
+    @staticmethod
+    def jitter(seconds):
+        return seconds * random.uniform(0.82, 1.18)
+
+    def delay_for_http(self, code, body_text, retry_after=None):
+        if code in (200, 201):
+            self.reset()
+            return 0.0, "success"
+        if code == 401 or code == 403:
+            return None, "auth_stop"
+        if code == 400:
+            return None, "bad_payload_stop"
+        if code == 429:
+            if retry_after:
+                try:
+                    return max(1.0, float(retry_after)), "rate_limited"
+                except ValueError:
+                    pass
+            return 1.0, "rate_limited"
+        if code == 425:
+            self.not_ready_attempts += 1
+            return self.jitter(min(0.5, 0.25 + 0.05 * self.not_ready_attempts)), "not_ready"
+        if code == 503 and "E_HANDOVER" in body_text:
+            bases = [0.25, 0.5, 1.0, 2.0, 4.0, 5.0]
+            delay = bases[min(self.handover_attempts, len(bases) - 1)]
+            self.handover_attempts += 1
+            return self.jitter(delay), "handover"
+        return None, "http_stop"
+
+    def delay_for_timeout(self):
+        bases = [0.25, 0.5, 1.0, 2.0]
+        delay = bases[min(self.timeout_attempts, len(bases) - 1)]
+        self.timeout_attempts += 1
+        return self.jitter(delay), "timeout"
+
+
 class MatchClient:
-    def __init__(self, base_url, match_id, token, timeout, log_path):
+    def __init__(self, base_url, match_id, token, timeout, log_path, limiter):
         self.api = f"{base_url.rstrip('/')}/api/v1/matches/{match_id}"
         self.timeout = timeout
         self.log_path = log_path
+        self.limiter = limiter
         self.headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
         }
         self.last_elapsed_ms = 0
+        self.last_status = None
+        self.last_body = ""
+        self.last_retry_after = None
+        self.request_id = 0
+        self.inflight = False
+        self.overlap_count = 0
+        self.requests_total = 0
+        self.handover_count = 0
+        self.timeout_count = 0
+        self.request_start_times = []
 
-    def call(self, method, path, body=None, timeout=None):
+    def call(self, method, path, body=None, timeout=None, phase=HttpPhase.ACTIVE_DAY):
+        if self.inflight:
+            self.overlap_count += 1
+            write_log(self.log_path, f"ERROR overlap_request phase={phase.value} method={method} path={path} overlap_count={self.overlap_count}")
+        self.limiter.wait(phase, method, path)
+        self.inflight = True
+        self.request_id += 1
+        rid = self.request_id
+        self.requests_total += 1
+        self.request_start_times.append(time.time())
+        self.last_status = None
+        self.last_body = ""
+        self.last_retry_after = None
         data = None if body is None else json.dumps(body, separators=(",", ":")).encode("utf-8")
         req = urllib.request.Request(
             self.api + path,
@@ -115,21 +253,42 @@ class MatchClient:
                 payload = response.read()
                 elapsed = int((time.perf_counter() - started) * 1000)
                 self.last_elapsed_ms = elapsed
-                write_log(self.log_path, f"HTTP {method} {path} -> {response.status} {elapsed}ms")
+                self.last_status = response.status
+                write_log(self.log_path, f"HTTP phase={phase.value} request_id={rid} inflight=1 {method} {path} -> {response.status} {elapsed}ms")
                 if not payload:
                     return None
                 return json.loads(payload.decode("utf-8"))
         except urllib.error.HTTPError as exc:
             elapsed = int((time.perf_counter() - started) * 1000)
             self.last_elapsed_ms = elapsed
+            self.last_status = exc.code
+            self.last_retry_after = exc.headers.get("Retry-After") if exc.headers else None
             body_text = exc.read().decode("utf-8", errors="replace")
-            write_log(self.log_path, f"HTTP {method} {path} -> {exc.code} {elapsed}ms {body_text}")
+            self.last_body = body_text
+            if exc.code == 503 and "E_HANDOVER" in body_text:
+                self.handover_count += 1
+            write_log(self.log_path, f"HTTP phase={phase.value} request_id={rid} inflight=1 {method} {path} -> {exc.code} {elapsed}ms {body_text}")
             raise
         except Exception as exc:
             elapsed = int((time.perf_counter() - started) * 1000)
             self.last_elapsed_ms = elapsed
-            write_log(self.log_path, f"HTTP {method} {path} -> ERR {elapsed}ms {exc}")
+            self.timeout_count += 1
+            write_log(self.log_path, f"HTTP phase={phase.value} request_id={rid} inflight=1 {method} {path} -> ERR {elapsed}ms {exc}")
             raise
+        finally:
+            self.inflight = False
+
+    def request_rate_p95(self):
+        if not self.request_start_times:
+            return 0
+        buckets = {}
+        for stamp in self.request_start_times:
+            second = int(stamp)
+            buckets[second] = buckets.get(second, 0) + 1
+        counts = sorted(buckets.values())
+        if not counts:
+            return 0
+        return counts[min(len(counts) - 1, int(0.95 * len(counts)))]
 
 
 def read_bot_line(bot, context, log_path):
@@ -142,18 +301,29 @@ def read_bot_line(bot, context, log_path):
     return line
 
 
-def call_with_retry(client, method, path, body, retries=6, timeout=None, retry_base=0.25):
+def call_with_retry(client, method, path, body, retries=6, timeout=None, phase=HttpPhase.ACTIVE_DAY, backoff=None):
+    if backoff is None:
+        backoff = BackoffPolicy()
     for attempt in range(retries):
         try:
-            return client.call(method, path, body, timeout=timeout)
+            result = client.call(method, path, body, timeout=timeout, phase=phase)
+            backoff.reset()
+            return result
         except urllib.error.HTTPError as exc:
-            if exc.code != 429 or attempt == retries - 1:
+            delay, reason = backoff.delay_for_http(exc.code, client.last_body, client.last_retry_after)
+            if delay is None or attempt == retries - 1:
+                write_log(client.log_path, f"retry_stop phase={phase.value} method={method} path={path} code={exc.code} reason={reason} attempt={attempt}")
                 raise
-            time.sleep(retry_base + 0.15 * attempt)
+            delay_ms = int(delay * 1000)
+            write_log(client.log_path, f"backoff phase={phase.value} method={method} path={path} code={exc.code} reason={reason} attempt={attempt} backoff_ms={delay_ms}")
+            time.sleep(delay)
         except Exception:
             if attempt == retries - 1:
                 raise
-            time.sleep(retry_base + 0.05 * attempt)
+            delay, reason = backoff.delay_for_timeout()
+            delay_ms = int(delay * 1000)
+            write_log(client.log_path, f"backoff phase={phase.value} method={method} path={path} code=ERR reason={reason} attempt={attempt} backoff_ms={delay_ms}")
+            time.sleep(delay)
 
 
 def main():
@@ -162,11 +332,13 @@ def main():
     parser.add_argument("--match", required=True)
     parser.add_argument("--token", default=None)
     parser.add_argument("--bot", default="bot.exe")
-    parser.add_argument("--poll-ms", type=int, default=70)
-    parser.add_argument("--short-poll-ms", type=int, default=15)
+    parser.add_argument("--poll-ms", type=int, default=250)
+    parser.add_argument("--short-poll-ms", type=int, default=250)
     parser.add_argument("--fast-poll", action="store_true", help="Use shorter polling for short-day hard matches.")
     parser.add_argument("--timeout", type=float, default=2.0)
     parser.add_argument("--action-timeout", type=float, default=1.0)
+    parser.add_argument("--min-request-interval-ms", type=int, default=250)
+    parser.add_argument("--observer-if-locked", action="store_true", help="Do not submit when another leader owns this match/token.")
     args = parser.parse_args()
 
     token = load_token(args.token)
@@ -184,7 +356,20 @@ def main():
     http_log.write_text("", encoding="utf-8")
     replay.write_text("", encoding="utf-8")
 
-    client = MatchClient(args.url, args.match, token, args.timeout, http_log)
+    leader_lock = LeaderLock(args.match, token, http_log)
+    is_leader = leader_lock.acquire()
+    if not is_leader and not args.observer_if_locked:
+        raise SystemExit("Another run_cpp_http.py process is already leader for this match/token.")
+    if not is_leader and args.observer_if_locked:
+        write_log(http_log, "leader_lock observer_exit=1 reason=leader_already_running")
+        return
+
+    limiter = RequestLimiter(args.min_request_interval_ms, http_log)
+    client = MatchClient(args.url, args.match, token, args.timeout, http_log, limiter)
+    transport_phase = HttpPhase.WAIT_SETUP
+    setup_backoff = BackoffPolicy()
+    state_backoff = BackoffPolicy()
+    action_backoff = BackoffPolicy()
     stderr_path = match_dir / "bot.stderr.log"
     stderr_file = stderr_path.open("w", encoding="utf-8")
     bot = subprocess.Popen(
@@ -201,11 +386,40 @@ def main():
 
     try:
         setup = None
+        setup_path = match_dir / "setup.json"
+        if setup_path.exists():
+            try:
+                setup = json.loads(setup_path.read_text(encoding="utf-8"))
+                write_log(http_log, f"setup_cache_hit=1 path={setup_path}")
+            except Exception as exc:
+                write_log(http_log, f"setup_cache_hit=0 cache_error={exc}")
+                setup = None
         while setup is None:
             try:
-                setup = client.call("GET", "/setup")
+                setup = call_with_retry(
+                    client,
+                    "GET",
+                    "/setup",
+                    None,
+                    retries=1,
+                    timeout=args.timeout,
+                    phase=transport_phase,
+                    backoff=setup_backoff,
+                )
+                if setup is not None:
+                    setup_backoff.reset()
+                    write_log(http_log, "setup_cache_hit=0 setup_loaded=1")
+                    break
+            except urllib.error.HTTPError as exc:
+                delay, reason = setup_backoff.delay_for_http(exc.code, client.last_body, client.last_retry_after)
+                if delay is None:
+                    raise
+                write_log(http_log, f"backoff phase={transport_phase.value} method=GET path=/setup code={exc.code} reason={reason} backoff_ms={int(delay * 1000)}")
+                time.sleep(delay)
             except Exception:
-                time.sleep(args.poll_ms / 1000)
+                delay, reason = setup_backoff.delay_for_timeout()
+                write_log(http_log, f"backoff phase={transport_phase.value} method=GET path=/setup code=ERR reason={reason} backoff_ms={int(delay * 1000)}")
+                time.sleep(delay)
 
         day_seconds = setup.get("daySeconds", [])
         min_day_seconds = min(day_seconds) if day_seconds else None
@@ -213,9 +427,11 @@ def main():
         tight_day = min_day_seconds is not None and min_day_seconds <= 2
         poll_ms = args.poll_ms
         if tight_day:
-            poll_ms = min(poll_ms, args.short_poll_ms)
+            poll_ms = max(args.min_request_interval_ms, min(poll_ms, args.short_poll_ms))
         elif args.fast_poll or (min_day_seconds is not None and min_day_seconds <= 15):
-            poll_ms = min(poll_ms, 70)
+            poll_ms = max(args.min_request_interval_ms, min(poll_ms, 250))
+        else:
+            poll_ms = max(args.min_request_interval_ms, poll_ms)
         action_timeout = (
             min(args.timeout, args.action_timeout, max(0.45, min_day_seconds * 0.35))
             if tight_day
@@ -229,13 +445,26 @@ def main():
             f"state_timeout={state_timeout} action_timeout={action_timeout}",
         )
 
-        save_json(match_dir / "setup.json", setup)
+        save_json(setup_path, setup)
         append_replay(replay, setup)
         bot.stdin.write(json.dumps(setup, separators=(",", ":")) + "\n")
         bot.stdin.flush()
         assignment_raw = read_bot_line(bot, "assignment", http_log)
         (match_dir / "assignment.raw.json").write_text(assignment_raw, encoding="utf-8")
-        call_with_retry(client, "POST", "/assignment", json.loads(assignment_raw))
+        transport_phase = HttpPhase.WAIT_START
+        assignment_marker = match_dir / "assignment.submitted"
+        if assignment_marker.exists():
+            write_log(http_log, f"Assignment already submitted for match {args.match}; skip duplicate POST")
+        elif is_leader:
+            call_with_retry(
+                client,
+                "POST",
+                "/assignment",
+                json.loads(assignment_raw),
+                phase=transport_phase,
+                backoff=action_backoff,
+            )
+            assignment_marker.write_text(str(time.time()), encoding="ascii")
         assignment_submitted_at = time.perf_counter()
         write_log(http_log, f"Assignment submitted for match {args.match}")
 
@@ -246,10 +475,12 @@ def main():
         post_samples_ms = []
         first_state_seen = False
         state_errors = 0
+        last_result_probe_at = 0.0
         while bot.poll() is None:
             handled_new_day = False
             try:
-                state = client.call("GET", "/state", timeout=state_timeout)
+                transport_phase = HttpPhase.ACTIVE_DAY
+                state = client.call("GET", "/state", timeout=state_timeout, phase=transport_phase)
                 state_latency_ms = client.last_elapsed_ms
                 state_errors = 0
                 if state is not None and state.get("day") != current_day:
@@ -309,15 +540,17 @@ def main():
                     actions_raw = read_bot_line(bot, f"day {day}", http_log)
                     (match_dir / f"day-{day}-actions.raw.json").write_text(actions_raw, encoding="utf-8")
                     post_started = time.perf_counter()
-                    call_with_retry(
-                        client,
-                        "POST",
-                        "/actions",
-                        json.loads(actions_raw),
-                        retries=2 if tight_day else 6,
-                        timeout=action_timeout,
-                        retry_base=0.05 if short_day else 0.25,
-                    )
+                    if is_leader:
+                        call_with_retry(
+                            client,
+                            "POST",
+                            "/actions",
+                            json.loads(actions_raw),
+                            retries=2 if tight_day else 6,
+                            timeout=action_timeout,
+                            phase=HttpPhase.ACTIVE_DAY,
+                            backoff=action_backoff,
+                        )
                     post_ms = int((time.perf_counter() - post_started) * 1000)
                     post_samples_ms.append(post_ms)
                     if len(post_samples_ms) > 20:
@@ -331,12 +564,27 @@ def main():
                         write_log(http_log, f"Submitted day {day} post_ms={post_ms} submit_deadline_margin_ms={margin_after_post_ms}")
                     else:
                         write_log(http_log, f"Submitted day {day} post_ms={post_ms}")
-            except Exception:
+                    transport_phase = HttpPhase.AFTER_VALID_ACTION
+            except Exception as exc:
                 state_errors += 1
-                if state_errors >= 4:
+                error_delay = poll_ms / 1000.0
+                if isinstance(exc, urllib.error.HTTPError):
+                    delay, reason = state_backoff.delay_for_http(exc.code, client.last_body, client.last_retry_after)
+                    if delay is None:
+                        raise
+                    error_delay = delay
+                    write_log(http_log, f"backoff phase={transport_phase.value} method=GET path=/state code={exc.code} reason={reason} backoff_ms={int(error_delay * 1000)}")
+                else:
+                    delay, reason = state_backoff.delay_for_timeout()
+                    error_delay = delay
+                    write_log(http_log, f"backoff phase={transport_phase.value} method=GET path=/state code=ERR reason={reason} backoff_ms={int(error_delay * 1000)}")
+                now = time.perf_counter()
+                if state_errors >= 4 and now - last_result_probe_at >= 1.0:
+                    last_result_probe_at = now
                     try:
-                        result = client.call("GET", "/result")
+                        result = client.call("GET", "/result", phase=HttpPhase.FINISHED)
                         if result is not None:
+                            transport_phase = HttpPhase.FINISHED
                             save_json(match_dir / "result.json", result)
                             expected_days = len(setup.get("daySteps", []))
                             absent = [d for d in range(expected_days) if d not in submitted_days]
@@ -353,11 +601,20 @@ def main():
                             break
                     except Exception:
                         pass
-                time.sleep(poll_ms / 1000)
+                time.sleep(error_delay)
+                handled_new_day = True
 
             if not (tight_day and handled_new_day):
                 time.sleep(poll_ms / 1000)
     finally:
+        write_log(
+            http_log,
+            f"SUMMARY requests_total={client.requests_total} "
+            f"requests_per_second_p95={client.request_rate_p95()} "
+            f"overlap_count={client.overlap_count} "
+            f"handover_count={client.handover_count} "
+            f"timeout_count={client.timeout_count}",
+        )
         if bot.poll() is None:
             bot.kill()
         stderr_file.close()
@@ -365,6 +622,7 @@ def main():
             stderr = stderr_path.read_text(encoding="utf-8")
             if stderr:
                 Path(f"run_{args.match}.err.log").write_text(stderr, encoding="utf-8")
+        leader_lock.release()
 
 
 if __name__ == "__main__":

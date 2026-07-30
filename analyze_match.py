@@ -132,6 +132,45 @@ def main():
             setup_match = re.search(r"setup width=.* selected_assignment_reason=([a-z_]+)", line)
             if setup_match and not setup_assignment_reason:
                 setup_assignment_reason = setup_match.group(1)
+            brand_constraint_match = re.search(r"brand_constraint day=(\d+) .*max_reachable=(\d+)", line)
+            if brand_constraint_match:
+                day = int(brand_constraint_match.group(1))
+                if day in stderr_quality:
+                    stderr_quality[day]["brand_max_reachable"] = int(brand_constraint_match.group(2))
+            set_packing_match = re.search(r"set_packing day=(\d+) .*states=(\d+).*selected_exact=(\d+).*selected_brands=(\d+).*interrupted=(\d+)", line)
+            if set_packing_match:
+                day = int(set_packing_match.group(1))
+                if day in stderr_quality:
+                    stderr_quality[day]["set_packing_states"] = int(set_packing_match.group(2))
+                    stderr_quality[day]["set_packing_exact"] = int(set_packing_match.group(3))
+                    stderr_quality[day]["set_packing_brands"] = int(set_packing_match.group(4))
+                    stderr_quality[day]["set_packing_interrupted"] = int(set_packing_match.group(5))
+                    mode_match = re.search(r"mode=([a-z_]+)", line)
+                    if mode_match:
+                        stderr_quality[day]["set_packing_mode"] = mode_match.group(1)
+                    feasible_match = re.search(r"feasible_complete_states=(\d+)", line)
+                    if feasible_match:
+                        stderr_quality[day]["set_packing_feasible_states"] = int(feasible_match.group(1))
+            preservation_match = re.search(r"set_packing_preservation day=(\d+) .*selected_exact=(\d+).*simulated_exact=(\d+).*simulated_server=(\d+).*simulated_negative_slack=(-?\d+)", line)
+            if preservation_match:
+                day = int(preservation_match.group(1))
+                if day in stderr_quality:
+                    stderr_quality[day]["set_packing_selected_exact"] = int(preservation_match.group(2))
+                    stderr_quality[day]["set_packing_simulated_exact"] = int(preservation_match.group(3))
+                    stderr_quality[day]["set_packing_simulated_server"] = int(preservation_match.group(4))
+                    stderr_quality[day]["set_packing_simulated_negative_slack"] = int(preservation_match.group(5))
+                    stderr_quality[day]["set_packing_preservation_gap"] = max(
+                        0,
+                        int(preservation_match.group(2)) - int(preservation_match.group(3)),
+                    )
+            rendezvous_match = re.search(r"rendezvous_candidate day=(\d+).*shared_step=(-?\d+).*portions_saved=(-?\d+)", line)
+            if rendezvous_match:
+                day = int(rendezvous_match.group(1))
+                if day in stderr_quality:
+                    stderr_quality[day]["rendezvous_candidates"] = stderr_quality[day].get("rendezvous_candidates", 0) + 1
+                    if int(rendezvous_match.group(2)) >= 0:
+                        stderr_quality[day]["rendezvous_executable"] = stderr_quality[day].get("rendezvous_executable", 0) + 1
+                    stderr_quality[day]["rendezvous_saved_portions"] = stderr_quality[day].get("rendezvous_saved_portions", 0) + int(rendezvous_match.group(3))
             patrol_match = re.search(r"patrol day=(\d+) .* steps=(\d+) visits=(\d+) .* slack=(-?\d+) road_use=(\d+)", line)
             if patrol_match:
                 day = int(patrol_match.group(1))
@@ -186,6 +225,7 @@ def main():
                         "reachable_stock_next_day",
                         "final_stock_execution_efficiency", "final_visit_usefulness",
                         "final_end_to_end_visit_yield",
+                        "final_assigned_visits", "final_exact_collected",
                     ):
                         if key in pairs:
                             stderr_quality[day][key] = int(pairs[key])
@@ -237,11 +277,42 @@ def main():
                         stderr_quality[day]["selected_rollout_total_server"] = pairs["total_server"]
                     if "collapse_days" in pairs:
                         stderr_quality[day]["selected_rollout_collapse_days"] = pairs["collapse_days"]
+            rollout_exact_match = re.search(r"rollout_exact day=(\d+) (.*)", line)
+            if rollout_exact_match:
+                day = int(rollout_exact_match.group(1))
+                if day in stderr_quality:
+                    pairs = dict((key, int(value)) for key, value in re.findall(r"([a-z_]+)=(-?\d+)", rollout_exact_match.group(2)))
+                    stderr_quality[day]["rollout_exact_future_brand_days"] = max(
+                        stderr_quality[day].get("rollout_exact_future_brand_days", 0),
+                        pairs.get("future_brand_days", 0),
+                    )
+                    stderr_quality[day]["rollout_exact_future_portions"] = max(
+                        stderr_quality[day].get("rollout_exact_future_portions", 0),
+                        pairs.get("future_portions", 0),
+                    )
+            exact_sim_match = re.search(r"exact_sim_summary day=(\d+) (.*)", line)
+            if exact_sim_match:
+                day = int(exact_sim_match.group(1))
+                if day in stderr_quality:
+                    pairs = dict((key, int(value)) for key, value in re.findall(r"([a-z_]+)=(-?\d+)", exact_sim_match.group(2)))
+                    for key in (
+                        "valid", "exact_collected", "daily_brands",
+                        "final_negative_slack", "ghost_visits", "server_est",
+                        "effective_est", "assigned_stock", "min_final_fuel",
+                        "final_positions_hash", "assigned_visits", "exact_gap",
+                    ):
+                        if key in pairs:
+                            stderr_quality[day][f"exact_{key}"] = pairs[key]
             ghost_compression_match = re.search(r"ghost_compression day=(\d+)", line)
             if ghost_compression_match:
                 day = int(ghost_compression_match.group(1))
                 if day in stderr_quality:
                     stderr_quality[day]["ghost_compressions"] = stderr_quality[day].get("ghost_compressions", 0) + 1
+            ghost_reassign_match = re.search(r"ghost_reassign_repair day=(\d+)", line)
+            if ghost_reassign_match:
+                day = int(ghost_reassign_match.group(1))
+                if day in stderr_quality:
+                    stderr_quality[day]["ghost_reassign_repairs"] = stderr_quality[day].get("ghost_reassign_repairs", 0) + 1
             timing_match = re.search(r"planner_timing day=(\d+) compute_ms=(\d+) budget_ms=(\d+)(.*)", line)
             if timing_match:
                 day = int(timing_match.group(1))
@@ -264,6 +335,12 @@ def main():
                 if day in stderr_quality:
                     stderr_quality[day]["risk_repairs"] = stderr_quality[day].get("risk_repairs", 0) + 1
                     stderr_quality[day]["last_risk_repair_agent"] = int(risk_repair_match.group(2))
+            anytime_repair_match = re.search(r"anytime_repair day=(\d+) .*type=([a-z_]+).*accepted=(\d+).*exact_delta=(-?\d+)", line)
+            if anytime_repair_match:
+                day = int(anytime_repair_match.group(1))
+                if day in stderr_quality:
+                    stderr_quality[day]["anytime_repairs"] = stderr_quality[day].get("anytime_repairs", 0) + int(anytime_repair_match.group(3))
+                    stderr_quality[day]["anytime_exact_delta"] = stderr_quality[day].get("anytime_exact_delta", 0) + int(anytime_repair_match.group(4))
             cache_match = re.search(r"state_cache day=(\d+) .*retry_index=(\d+) cache_hit=(\d+)", line)
             if cache_match:
                 day = int(cache_match.group(1))
@@ -368,6 +445,7 @@ def main():
         tanker_idle = 0
         fuel_ends = []
         fuel_end_by_agent = {}
+        pos_end_by_agent = {}
         fuel_used = 0
         road_uses = 0
         road_wait_steps = 0
@@ -435,19 +513,29 @@ def main():
                 if fuel <= max(18, fuel_limit // 5):
                     low_fuel += 1
                 fuel_end_by_agent[agent_id] = fuel
+                pos_end_by_agent[agent_id] = pos
             elif not moved:
                 tanker_idle += 1
 
         actual_refuels = 0
+        position_mismatch = 0
+        fuel_mismatch = 0
         next_state_path = base / f"day-{day + 1}-state.json"
         if next_state_path.exists():
             next_state = load_json(next_state_path)
+            for agent_id, pos_end in pos_end_by_agent.items():
+                if agent_id >= len(next_state.get("agents", [])):
+                    continue
+                if next_state["agents"][agent_id].get("pos") != pos_end:
+                    position_mismatch += 1
             for agent_id, fuel_end in fuel_end_by_agent.items():
                 if agent_id >= len(next_state.get("agents", [])):
                     continue
                 next_fuel = next_state["agents"][agent_id].get("fuel", fuel_end)
                 if next_fuel == fuel_limit and next_fuel > fuel_end:
                     actual_refuels += 1
+                elif next_fuel != fuel_end:
+                    fuel_mismatch += 1
 
         assigned_visits = sum(by_spot.values())
         capped = sum(min(by_spot[i], spots[i].get("stocks", spots[i].get("stock", spots[i].get("amount", 1)))) for i in by_spot)
@@ -559,12 +647,15 @@ def main():
             "team_states": quality.get("team_states", 0),
             "timeout_stage": quality.get("timeout_stage", "none"),
             "actual_refuels": actual_refuels,
+            "position_mismatch": position_mismatch,
+            "fuel_mismatch": fuel_mismatch,
             "tanker_idle": tanker_idle,
             "tanker_reason": quality.get("tanker_reason"),
             "logged_tanker_idle_streak": quality.get("logged_tanker_idle_streak"),
             "last_portion_repairs": quality.get("last_portion_repairs", 0),
             "risk_repairs": quality.get("risk_repairs", 0),
             "ghost_compressions": quality.get("ghost_compressions", 0),
+            "ghost_reassign_repairs": quality.get("ghost_reassign_repairs", 0),
             "retry_count": quality.get("retry_count", 0),
             "cached_plan_returns": quality.get("cached_plan_returns", 0),
             "debt_duplicate_updates": quality.get("debt_duplicate_updates", 0),
@@ -578,6 +669,26 @@ def main():
             "selected_rollout_collapse_days": quality.get("selected_rollout_collapse_days", 0),
             "rollout_future_server": quality.get("rollout_future_server", 0),
             "rollout_reachable_next": quality.get("rollout_reachable_next", 0),
+            "exact_valid": quality.get("exact_valid"),
+            "exact_collected": quality.get("exact_exact_collected"),
+            "exact_assigned_stock": quality.get("exact_assigned_stock"),
+            "exact_assigned_visits": quality.get("exact_assigned_visits"),
+            "exact_gap": quality.get("exact_exact_gap", max(0, quality.get("exact_assigned_stock", capped) - quality.get("exact_exact_collected", capped))),
+            "exact_server_est": quality.get("exact_server_est"),
+            "exact_effective_est": quality.get("exact_effective_est"),
+            "brand_max_reachable": quality.get("brand_max_reachable", 0),
+            "set_packing_states": quality.get("set_packing_states", 0),
+            "set_packing_mode": quality.get("set_packing_mode", ""),
+            "set_packing_feasible_states": quality.get("set_packing_feasible_states", 0),
+            "set_packing_preservation_gap": quality.get("set_packing_preservation_gap", 0),
+            "set_packing_simulated_exact": quality.get("set_packing_simulated_exact", 0),
+            "set_packing_interrupted": quality.get("set_packing_interrupted", 0),
+            "rendezvous_executable": quality.get("rendezvous_executable", 0),
+            "rendezvous_candidates": quality.get("rendezvous_candidates", 0),
+            "rollout_exact_future_brand_days": quality.get("rollout_exact_future_brand_days", 0),
+            "rollout_exact_future_portions": quality.get("rollout_exact_future_portions", 0),
+            "anytime_repairs": quality.get("anytime_repairs", 0),
+            "anytime_exact_delta": quality.get("anytime_exact_delta", 0),
             "best_plan_improvement_timeline": quality.get("best_plan_improvement_timeline", []),
         })
         print(
@@ -604,6 +715,7 @@ def main():
             f"compute_ms={quality.get('compute_ms', '')} budget_ms={quality.get('budget_ms', '')} "
             f"refuels={quality.get('feasible_refuels', 0)}/{quality.get('planned_refuels', 0)} "
             f"actual_refuels={actual_refuels} tanker_idle={tanker_idle} "
+            f"position_mismatch={position_mismatch} fuel_mismatch={fuel_mismatch} "
             f"tanker_reason={quality.get('tanker_reason', '')} "
             f"failed_rendezvous={quality.get('failed_rendezvous', 0)} "
             f"dijkstra={quality.get('dijkstra_calls', 0)} cache_hits={quality.get('path_cache_hits', 0)} "
@@ -612,9 +724,21 @@ def main():
             f"fast_debt={quality.get('fast_debt', '')} strong_debt={quality.get('strong_debt', '')} "
             f"last_portion_missing={last_portion_missing} repairs={quality.get('last_portion_repairs', 0)} "
             f"risk_repairs={quality.get('risk_repairs', 0)} ghost_compressions={quality.get('ghost_compressions', 0)} "
+            f"ghost_reassign_repairs={quality.get('ghost_reassign_repairs', 0)} "
             f"reachable_stock_next_day={quality.get('reachable_stock_next_day', '')} "
             f"retry_count={quality.get('retry_count', 0)} cached_returns={quality.get('cached_plan_returns', 0)} debt_duplicate_updates={quality.get('debt_duplicate_updates', 0)} "
             f"final_summary={quality.get('has_final_plan_summary', 0)} action_hash={quality.get('serialized_action_hash', '')} "
+            f"exact_valid={quality.get('exact_valid', '')} exact_collected={quality.get('exact_exact_collected', '')} "
+            f"exact_assigned={quality.get('exact_assigned_stock', '')} exact_assigned_visits={quality.get('exact_assigned_visits', '')} "
+            f"exact_gap={quality.get('exact_exact_gap', max(0, quality.get('exact_assigned_stock', capped) - quality.get('exact_exact_collected', capped)))} "
+            f"exact_effective_est={quality.get('exact_effective_est', quality.get('exact_server_est', ''))} "
+            f"brand_max_reachable={quality.get('brand_max_reachable', '')} "
+            f"set_packing_mode={quality.get('set_packing_mode', '')} "
+            f"set_packing_states={quality.get('set_packing_states', '')} feasible_states={quality.get('set_packing_feasible_states', '')} "
+            f"set_packing_sim_exact={quality.get('set_packing_simulated_exact', '')} set_packing_gap={quality.get('set_packing_preservation_gap', '')} "
+            f"rendezvous_exec={quality.get('rendezvous_executable', 0)}/{quality.get('rendezvous_candidates', 0)} "
+            f"rollout_exact_brands={quality.get('rollout_exact_future_brand_days', '')} rollout_exact_portions={quality.get('rollout_exact_future_portions', '')} "
+            f"anytime_repairs={quality.get('anytime_repairs', 0)} anytime_exact_delta={quality.get('anytime_exact_delta', 0)} "
             f"top_missing={top_missing_text}"
         )
         if args.rules_check and (invalid or budget_violations):
@@ -690,8 +814,11 @@ def main():
     end_on_road_total = 0
     assigned_visits_total = 0
     ghost_visits_total = 0
+    position_mismatch_total = 0
+    fuel_mismatch_total = 0
     route_signature_duplicates_total = 0
     risk_repairs_total = 0
+    ghost_reassign_repairs_total = 0
     cached_plan_returns_total = 0
     retry_count_total = 0
     debt_duplicate_updates_total = 0
@@ -701,6 +828,17 @@ def main():
     rollout_policy_counts = {}
     selected_rollout_future_total = 0
     selected_rollout_total_total = 0
+    brand_constraint_loss_days = []
+    set_packing_states_total = 0
+    set_packing_feasible_states_total = 0
+    set_packing_mode_counts = {}
+    set_packing_interrupted_days = []
+    rendezvous_candidates_total = 0
+    rendezvous_executable_total = 0
+    rollout_exact_future_brand_days_total = 0
+    rollout_exact_future_portions_total = 0
+    anytime_repairs_total = 0
+    anytime_exact_delta_total = 0
     improvement_timeline_parts = []
     for day in range(len(day_steps)):
         quality = stderr_quality.get(day, {})
@@ -727,8 +865,11 @@ def main():
         end_on_road_total += row.get("end_on_road_routes", 0)
         assigned_visits_total += row.get("assigned_visits", 0)
         ghost_visits_total += row.get("ghost_visits", 0)
+        position_mismatch_total += row.get("position_mismatch", 0)
+        fuel_mismatch_total += row.get("fuel_mismatch", 0)
         route_signature_duplicates_total += row.get("route_signature_duplicates", 0)
         risk_repairs_total += row.get("risk_repairs", 0)
+        ghost_reassign_repairs_total += row.get("ghost_reassign_repairs", 0)
         cached_plan_returns_total += row.get("cached_plan_returns", 0)
         retry_count_total += row.get("retry_count", 0)
         debt_duplicate_updates_total += row.get("debt_duplicate_updates", 0)
@@ -746,6 +887,21 @@ def main():
             rollout_policy_counts[policy] = rollout_policy_counts.get(policy, 0) + 1
         selected_rollout_future_total += row.get("selected_rollout_future_server", 0)
         selected_rollout_total_total += row.get("selected_rollout_total_server", 0)
+        if row.get("brand_max_reachable", 0) and row.get("brands", 0) < row.get("brand_max_reachable", 0):
+            brand_constraint_loss_days.append(row.get("day"))
+        set_packing_states_total += row.get("set_packing_states", 0)
+        set_packing_feasible_states_total += row.get("set_packing_feasible_states", 0)
+        mode = row.get("set_packing_mode")
+        if mode:
+            set_packing_mode_counts[mode] = set_packing_mode_counts.get(mode, 0) + 1
+        if row.get("set_packing_interrupted", 0):
+            set_packing_interrupted_days.append(row.get("day"))
+        rendezvous_candidates_total += row.get("rendezvous_candidates", 0)
+        rendezvous_executable_total += row.get("rendezvous_executable", 0)
+        rollout_exact_future_brand_days_total += row.get("rollout_exact_future_brand_days", 0)
+        rollout_exact_future_portions_total += row.get("rollout_exact_future_portions", 0)
+        anytime_repairs_total += row.get("anytime_repairs", 0)
+        anytime_exact_delta_total += row.get("anytime_exact_delta", 0)
         actual_refuels_total += row.get("actual_refuels", 0)
         if row.get("tanker_idle", 0) > 0:
             tanker_idle_days += 1
@@ -764,6 +920,7 @@ def main():
         if values
     )
     rollout_policy_counts_text = ",".join(f"{key}:{value}" for key, value in sorted(rollout_policy_counts.items()))
+    set_packing_mode_counts_text = ",".join(f"{key}:{value}" for key, value in sorted(set_packing_mode_counts.items()))
 
     http_path = base / "http.log"
     bot_ms = []
@@ -777,15 +934,25 @@ def main():
     negative_margin_days = set()
     summary_deadline_invalid_days = set()
     setup_to_first_state_ms = 0
+    requests_total = 0
+    requests_per_second_p95 = 0
+    overlap_count = 0
+    handover_count = 0
+    timeout_count = 0
+    leader_conflict = False
+    rate_invalid = False
+    handover_storm = False
     if http_path.exists():
         for line in http_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if "leader_lock acquired=0" in line:
+                leader_conflict = True
             first_state_match = re.search(r"setup_to_first_state_ms=(\d+)", line)
             if first_state_match:
                 setup_to_first_state_ms = int(first_state_match.group(1))
             bot_match = re.search(r"BOT day \d+ -> (\d+)ms", line)
             if bot_match:
                 bot_ms.append(int(bot_match.group(1)))
-            state_http_match = re.search(r"HTTP GET /state -> \d+ (\d+)ms", line)
+            state_http_match = re.search(r"HTTP .*GET /state -> \d+ (\d+)ms", line)
             if state_http_match:
                 state_ms.append(int(state_http_match.group(1)))
             post_match = re.search(r"Submitted day \d+ post_ms=(\d+)", line)
@@ -815,6 +982,19 @@ def main():
                     raw = raw.strip()
                     if raw:
                         summary_deadline_invalid_days.add(int(raw))
+            transport_summary_match = re.search(
+                r"SUMMARY requests_total=(\d+) requests_per_second_p95=(\d+) overlap_count=(\d+) handover_count=(\d+) timeout_count=(\d+)",
+                line,
+            )
+            if transport_summary_match:
+                requests_total = int(transport_summary_match.group(1))
+                requests_per_second_p95 = int(transport_summary_match.group(2))
+                overlap_count = int(transport_summary_match.group(3))
+                handover_count = int(transport_summary_match.group(4))
+                timeout_count = int(transport_summary_match.group(5))
+
+    rate_invalid = requests_per_second_p95 > 4 or overlap_count > 0
+    handover_storm = handover_count >= 10 or timeout_count >= 10
 
     avg_bot_ms = int(sum(bot_ms) / len(bot_ms)) if bot_ms else 0
     max_bot_ms = max(bot_ms) if bot_ms else 0
@@ -826,7 +1006,7 @@ def main():
     min_margin = min(margins) if margins else 0
     min_state_margin = min(state_margins) if state_margins else 0
     min_submit_margin = min(submit_margins) if submit_margins else 0
-    transport_invalid = bool(missing_action_days or http_missing_days or day_jump_count)
+    transport_invalid = bool(missing_action_days or http_missing_days or day_jump_count or rate_invalid or leader_conflict or handover_storm)
     deadline_invalid = bool(negative_margin_days or summary_deadline_invalid_days)
     match_classification = "farm_valid"
     if transport_invalid:
@@ -854,6 +1034,8 @@ def main():
         f"road_gap_risk={max(0, total - conservative_total)} "
         f"ghost_stock_total={max(0, total - conservative_total)} "
         f"ghost_visits_total={ghost_visits_total} "
+        f"position_mismatch_total={position_mismatch_total} "
+        f"fuel_mismatch_total={fuel_mismatch_total} "
         f"reachable_cap_est={reachable_cap_est} "
         f"reachable_capture_ratio={(int(100 * total / reachable_cap_est) if reachable_cap_est else 0)}% "
         f"top_missing_spots_total={top_missing_total_text} "
@@ -865,6 +1047,10 @@ def main():
         f"negative_margin_days={sorted(negative_margin_days)} avg_margin_ms={avg_margin} "
         f"min_margin_ms={min_margin} min_state_margin_ms={min_state_margin} "
         f"min_submit_margin_ms={min_submit_margin} transport_invalid={int(transport_invalid)} "
+        f"rate_invalid={int(rate_invalid)} handover_storm={int(handover_storm)} "
+        f"leader_conflict={int(leader_conflict)} requests_total={requests_total} "
+        f"requests_per_second_p95={requests_per_second_p95} overlap_count={overlap_count} "
+        f"handover_count={handover_count} timeout_count={timeout_count} "
         f"deadline_invalid={int(deadline_invalid)} match_classification={match_classification} "
         f"farm_benchmark_valid={int(farm_benchmark_valid)} "
         f"profile_counts={profile_counts_text} selected_reasons={selected_reasons_text} "
@@ -872,8 +1058,17 @@ def main():
         f"rollout_policy_counts={rollout_policy_counts_text} "
         f"selected_rollout_future_total={selected_rollout_future_total} "
         f"selected_rollout_total_total={selected_rollout_total_total} "
+        f"brand_constraint_loss={brand_constraint_loss_days} "
+        f"set_packing_states_total={set_packing_states_total} "
+        f"set_packing_feasible_states_total={set_packing_feasible_states_total} "
+        f"set_packing_modes={set_packing_mode_counts_text} "
+        f"set_packing_interrupted_days={set_packing_interrupted_days} "
+        f"rollout_exact_future_brand_days_total={rollout_exact_future_brand_days_total} "
+        f"rollout_exact_future_portions_total={rollout_exact_future_portions_total} "
+        f"anytime_repairs_total={anytime_repairs_total} anytime_exact_delta_total={anytime_exact_delta_total} "
         f"last_portion_missing={last_portion_missing_total} last_portion_repairs={last_portion_repairs_total} "
         f"risk_repairs={risk_repairs_total} "
+        f"ghost_reassign_repairs={ghost_reassign_repairs_total} "
         f"road_wait_steps_total={road_wait_steps_total} end_on_road_total={end_on_road_total} "
         f"route_signature_duplicates_total={route_signature_duplicates_total} "
         f"retry_count={retry_count_total} cached_plan_returns={cached_plan_returns_total} debt_duplicate_updates={debt_duplicate_updates_total} "
@@ -882,6 +1077,7 @@ def main():
         f"strong_rejected_count={strong_rejected_count} strong_over_budget_days={strong_over_budget_days} "
         f"planned_refuels={planned_refuels_total} feasible_refuels={feasible_refuels_total} "
         f"actual_refuels={actual_refuels_total} failed_rendezvous={failed_rendezvous_total} "
+        f"rendezvous_success_rate={(int(100 * rendezvous_executable_total / max(1, rendezvous_candidates_total)) if rendezvous_candidates_total else 100)} "
         f"tanker_idle_days={tanker_idle_days} tanker_idle_streak={max_tanker_idle_streak} "
         f"fuel_collapse_days={fuel_collapse_days}"
     )
@@ -921,6 +1117,8 @@ def main():
             "road_gap_risk": max(0, total - conservative_total),
             "ghost_stock_total": max(0, total - conservative_total),
             "ghost_visits_total": ghost_visits_total,
+            "position_mismatch_total": position_mismatch_total,
+            "fuel_mismatch_total": fuel_mismatch_total,
             "map_group": map_group,
             "width": width,
             "height": height,
@@ -946,6 +1144,7 @@ def main():
             "last_portion_missing": last_portion_missing_total,
             "last_portion_repairs": last_portion_repairs_total,
             "risk_repairs": risk_repairs_total,
+            "ghost_reassign_repairs": ghost_reassign_repairs_total,
             "road_wait_steps_total": road_wait_steps_total,
             "end_on_road_total": end_on_road_total,
             "route_signature_duplicates_total": route_signature_duplicates_total,

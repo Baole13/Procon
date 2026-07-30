@@ -60,11 +60,16 @@ foreach ($budget in $Budgets) {
 $results | Format-Table -AutoSize
 
 $baseline = $results | Where-Object { $_.budget_ms -eq $Budgets[0] } | Select-Object -First 1
+$previous = $null
 foreach ($row in $results) {
     if ($row.server_sum -lt $baseline.server_sum) {
         throw "Budget monotonic failed: $($row.budget_ms)ms server_sum $($row.server_sum) < baseline $($baseline.server_sum)"
     }
+    if ($previous -ne $null -and $row.server_sum -lt $previous.server_sum) {
+        throw "Budget monotonic failed: $($row.budget_ms)ms server_sum $($row.server_sum) < previous $($previous.server_sum)"
+    }
     if ($row.negative_slack_sum -ne 0) {
         throw "Feasibility failed: $($row.budget_ms)ms negative_slack_sum=$($row.negative_slack_sum)"
     }
+    $previous = $row
 }

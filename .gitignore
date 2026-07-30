@@ -37,6 +37,7 @@ obj/
 run_m-*.err.log
 matches/
 benchmarks/
+.tmp_transport_tests/
 
 # Editor and OS files
 .vscode/
@@ -51,4 +52,3 @@ plan.md
 ptich.md
 /versions
 debai.md
-
