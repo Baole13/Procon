@@ -1,91 +1,70 @@
 param(
-    [string]$MatchId,
-    [string[]]$MatchIds = @("m-0598", "m-0600", "m-0603", "m-0604"),
-    [int[]]$Budgets = @(20, 50, 100, 200, 500, 1000),
-    [int]$DaySeconds = 5,
-    [int]$DeadlineMarginMs = 4000
+    [Parameter(Mandatory=$true)]
+    [string]$Replay,
+    [int[]]$Budgets = @(200, 1000, 5000),
+    [string]$Bot = ".\bot.exe"
 )
 
-$bot = Join-Path $PSScriptRoot "..\bot.exe"
-if (-not (Test-Path -LiteralPath $bot)) {
-    throw "Bot not found: $bot"
+if (!(Test-Path $Replay)) {
+    throw "Replay not found: $Replay"
+}
+if (!(Test-Path $Bot)) {
+    throw "Bot not found: $Bot"
 }
 
-if ($MatchId) {
-    $MatchIds = @($MatchId)
-}
-
-foreach ($currentMatchId in $MatchIds) {
-    $replay = Join-Path $PSScriptRoot "..\matches\$currentMatchId\replay.jsonl"
-    if (-not (Test-Path -LiteralPath $replay)) {
-        Write-Warning "Replay not found: $replay"
-        continue
-    }
-    if ($MatchIds.Count -gt 1) {
-        "--- $currentMatchId"
-    }
+$results = @()
 foreach ($budget in $Budgets) {
-    $output = Get-Content -LiteralPath $replay | ForEach-Object {
-        $message = $_ | ConvertFrom-Json
-        if ($null -ne $message.day) {
-            $message | Add-Member -NotePropertyName _hardBudgetMs -NotePropertyValue $budget
-            $message | Add-Member -NotePropertyName _daySeconds -NotePropertyValue $DaySeconds
-            $message | Add-Member -NotePropertyName _deadlineMarginMs -NotePropertyValue $DeadlineMarginMs
-        }
-        $message | ConvertTo-Json -Compress -Depth 100
-    } | & $bot 2>&1
+    $tmpIn = New-TemporaryFile
+    $tmpOut = New-TemporaryFile
+    $tmpErr = New-TemporaryFile
+    try {
+        Get-Content $Replay | ForEach-Object {
+            if ([string]::IsNullOrWhiteSpace($_)) { return }
+            $line = $_
+            if ($line -match '"day"\s*:' -and $line -match '"agents"\s*:') {
+                $meta = ',"_deadlineMarginMs":1000000,"_hardBudgetMs":' + $budget + ',"_daySeconds":5,"_ultraFastMode":0'
+                $line = $line -replace '}\s*$', ($meta + '}')
+            }
+            $line
+        } | Set-Content -Encoding ASCII $tmpIn
 
-    $selected = @{}
-    $reasons = @{}
-    $evals = @{}
-    $maxCompute = 0
-    foreach ($line in $output) {
-        $text = "$line"
-        if ($text -match "plan_compare day=(\d+) fast_brands=(\d+) fast_portions=(\d+) fast_server=(\d+).*strong_brands=(-?\d+) strong_portions=(-?\d+) strong_server=(-?\d+)") {
-            $evals[[int]$Matches[1]] = @{
-                FastBrands = [int]$Matches[2]
-                FastPortions = [int]$Matches[3]
-                FastServer = [int]$Matches[4]
-                StrongBrands = [int]$Matches[5]
-                StrongPortions = [int]$Matches[6]
-                StrongServer = [int]$Matches[7]
+        $botPath = (Resolve-Path $Bot).Path
+        cmd /c "`"$botPath`" < `"$tmpIn`" > `"$tmpOut`" 2> `"$tmpErr`""
+        if ($LASTEXITCODE -ne 0) {
+            throw "Bot failed for budget ${budget}ms"
+        }
+
+        $server = 0
+        $brands = 0
+        $negativeSlack = 0
+        foreach ($line in Get-Content $tmpErr) {
+            if ($line -match "final_plan_summary .*final_server_est=(\d+).*final_negative_slack=(-?\d+)") {
+                $server += [int]$Matches[1]
+                $negativeSlack += [int]$Matches[2]
+            }
+            if ($line -match "final_plan_summary .*final_daily_brands=(\d+)") {
+                $brands += [int]$Matches[1]
             }
         }
-        if ($text -match "plan_compare day=(\d+) selected=([a-z_]+)(?: selected_reason=([a-z_]+))?") {
-            $selected[[int]$Matches[1]] = $Matches[2]
-            if ($Matches[3]) {
-                $reason = $Matches[3]
-                if (-not $reasons.ContainsKey($reason)) { $reasons[$reason] = 0 }
-                $reasons[$reason] += 1
-            }
+        $results += [pscustomobject]@{
+            budget_ms = $budget
+            server_sum = $server
+            daily_brands_sum = $brands
+            negative_slack_sum = $negativeSlack
         }
-        if ($text -match "planner_timing day=\d+ compute_ms=(\d+)") {
-            $maxCompute = [Math]::Max($maxCompute, [int]$Matches[1])
-        }
+    } finally {
+        Remove-Item -Force $tmpIn,$tmpOut,$tmpErr -ErrorAction SilentlyContinue
     }
-
-    $brands = 0
-    $portions = 0
-    $server = 0
-    $selectedCounts = @{}
-    foreach ($day in $evals.Keys) {
-        $eval = $evals[$day]
-        $profile = $selected[$day]
-        if (-not $profile) { $profile = "fast_baseline" }
-        if (-not $selectedCounts.ContainsKey($profile)) { $selectedCounts[$profile] = 0 }
-        $selectedCounts[$profile] += 1
-        if ($profile -eq "strong") {
-            $brands += $eval.StrongBrands
-            $portions += $eval.StrongPortions
-            $server += $eval.StrongServer
-        } else {
-            $brands += $eval.FastBrands
-            $portions += $eval.FastPortions
-            $server += $eval.FastServer
-        }
-    }
-    $selectedText = ($selectedCounts.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Name):$($_.Value)" }) -join ","
-    $reasonText = ($reasons.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Name):$($_.Value)" }) -join ","
-    "budget_ms=$budget brands_sum=$brands portions_sum=$portions server_sum=$server max_compute_ms=$maxCompute selected=$selectedText reasons=$reasonText"
 }
+
+$results | Format-Table -AutoSize
+
+$baseline = $results | Where-Object { $_.budget_ms -eq $Budgets[0] } | Select-Object -First 1
+foreach ($row in $results) {
+    if ($row.server_sum -lt $baseline.server_sum) {
+        throw "Budget monotonic failed: $($row.budget_ms)ms server_sum $($row.server_sum) < baseline $($baseline.server_sum)"
+    }
+    if ($row.negative_slack_sum -ne 0) {
+        throw "Feasibility failed: $($row.budget_ms)ms negative_slack_sum=$($row.negative_slack_sum)"
+    }
 }

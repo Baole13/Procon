@@ -166,6 +166,82 @@ def main():
                     stderr_quality[day]["selected_profile"] = selected_match.group(2)
                     if selected_match.group(3):
                         stderr_quality[day]["selected_reason"] = selected_match.group(3)
+            pre_summary_match = re.search(r"pre_repair_summary day=(\d+)", line)
+            if pre_summary_match:
+                day = int(pre_summary_match.group(1))
+                if day in stderr_quality:
+                    stderr_quality[day]["has_pre_repair_summary"] = 1
+            final_summary_match = re.search(r"final_plan_summary day=(\d+) (.*)", line)
+            if final_summary_match:
+                day = int(final_summary_match.group(1))
+                if day in stderr_quality:
+                    tail = final_summary_match.group(2)
+                    pairs = dict((key, value) for key, value in re.findall(r"([a-z_]+)=(-?\d+)", tail))
+                    text_pairs = dict((key, value) for key, value in re.findall(r"([a-z_]+)=([a-z_]+)", tail))
+                    stderr_quality[day]["has_final_plan_summary"] = 1
+                    for key in (
+                        "final_assigned_stock", "final_server_est", "final_negative_slack",
+                        "final_ghost_visits", "final_active_patrols", "final_daily_brands",
+                        "final_road_use", "final_team_fuel_risk", "final_fuel_opportunity_cost",
+                        "reachable_stock_next_day",
+                        "final_stock_execution_efficiency", "final_visit_usefulness",
+                        "final_end_to_end_visit_yield",
+                    ):
+                        if key in pairs:
+                            stderr_quality[day][key] = int(pairs[key])
+                    if "selected_plan" in text_pairs:
+                        stderr_quality[day]["selected_profile"] = text_pairs["selected_plan"]
+                    if "selected_reason" in text_pairs:
+                        stderr_quality[day]["selected_reason"] = text_pairs["selected_reason"]
+                    if "serialized_action_hash" in pairs:
+                        stderr_quality[day]["serialized_action_hash"] = int(pairs["serialized_action_hash"])
+            improvement_match = re.search(r"best_plan_improvement_timeline day=(\d+) stage=([a-z_]+) (.*)", line)
+            if improvement_match:
+                day = int(improvement_match.group(1))
+                if day in stderr_quality:
+                    stage = improvement_match.group(2)
+                    pairs = dict((key, int(value)) for key, value in re.findall(r"([a-z_]+)=(-?\d+)", improvement_match.group(3)))
+                    timeline = stderr_quality[day].setdefault("best_plan_improvement_timeline", [])
+                    timeline.append({"stage": stage, **pairs})
+            rollout_match = re.search(r"rollout_summary day=(\d+) (.*)", line)
+            if rollout_match:
+                day = int(rollout_match.group(1))
+                if day in stderr_quality:
+                    tail = rollout_match.group(2)
+                    pairs = dict((key, int(value)) for key, value in re.findall(r"([a-z_]+)=(-?\d+)", tail))
+                    text_pairs = dict((key, value) for key, value in re.findall(r"([a-z_]+)=([a-z_]+)", tail))
+                    summaries = stderr_quality[day].setdefault("rollout_summaries", [])
+                    summaries.append({**text_pairs, **pairs})
+                    if "future_server" in pairs:
+                        stderr_quality[day]["rollout_future_server"] = max(
+                            stderr_quality[day].get("rollout_future_server", 0),
+                            pairs["future_server"],
+                        )
+                    if "reachable_next" in pairs:
+                        stderr_quality[day]["rollout_reachable_next"] = max(
+                            stderr_quality[day].get("rollout_reachable_next", 0),
+                            pairs["reachable_next"],
+                        )
+            selected_rollout_match = re.search(r"selected_rollout_policy day=(\d+) (.*)", line)
+            if selected_rollout_match:
+                day = int(selected_rollout_match.group(1))
+                if day in stderr_quality:
+                    tail = selected_rollout_match.group(2)
+                    pairs = dict((key, int(value)) for key, value in re.findall(r"([a-z_]+)=(-?\d+)", tail))
+                    text_pairs = dict((key, value) for key, value in re.findall(r"([a-z_]+)=([a-z_]+)", tail))
+                    if "policy" in text_pairs:
+                        stderr_quality[day]["selected_rollout_policy"] = text_pairs["policy"]
+                    if "future_server" in pairs:
+                        stderr_quality[day]["selected_rollout_future_server"] = pairs["future_server"]
+                    if "total_server" in pairs:
+                        stderr_quality[day]["selected_rollout_total_server"] = pairs["total_server"]
+                    if "collapse_days" in pairs:
+                        stderr_quality[day]["selected_rollout_collapse_days"] = pairs["collapse_days"]
+            ghost_compression_match = re.search(r"ghost_compression day=(\d+)", line)
+            if ghost_compression_match:
+                day = int(ghost_compression_match.group(1))
+                if day in stderr_quality:
+                    stderr_quality[day]["ghost_compressions"] = stderr_quality[day].get("ghost_compressions", 0) + 1
             timing_match = re.search(r"planner_timing day=(\d+) compute_ms=(\d+) budget_ms=(\d+)(.*)", line)
             if timing_match:
                 day = int(timing_match.group(1))
@@ -187,7 +263,26 @@ def main():
                 day = int(risk_repair_match.group(1))
                 if day in stderr_quality:
                     stderr_quality[day]["risk_repairs"] = stderr_quality[day].get("risk_repairs", 0) + 1
-                    stderr_quality[day]["last_repair_spot"] = int(repair_match.group(2))
+                    stderr_quality[day]["last_risk_repair_agent"] = int(risk_repair_match.group(2))
+            cache_match = re.search(r"state_cache day=(\d+) .*retry_index=(\d+) cache_hit=(\d+)", line)
+            if cache_match:
+                day = int(cache_match.group(1))
+                if day in stderr_quality:
+                    stderr_quality[day]["retry_count"] = max(stderr_quality[day].get("retry_count", 0), int(cache_match.group(2)))
+                    stderr_quality[day]["cache_hits"] = stderr_quality[day].get("cache_hits", 0) + int(cache_match.group(3))
+            cached_return_match = re.search(r"state_cache day=(\d+) returned_cached_plan=1", line)
+            if cached_return_match:
+                day = int(cached_return_match.group(1))
+                if day in stderr_quality:
+                    stderr_quality[day]["cached_plan_returns"] = stderr_quality[day].get("cached_plan_returns", 0) + 1
+            debt_match = re.search(r"spot_debt day=(\d+) .*debt_committed=(\d+)", line)
+            if debt_match:
+                day = int(debt_match.group(1))
+                if day in stderr_quality:
+                    committed = int(debt_match.group(2))
+                    stderr_quality[day]["debt_commits"] = stderr_quality[day].get("debt_commits", 0) + committed
+                    if committed == 0:
+                        stderr_quality[day]["debt_duplicate_updates"] = stderr_quality[day].get("debt_duplicate_updates", 0) + 1
             stats_match = re.search(
                 r"planner_stats day=(\d+) dijkstra_calls=(\d+) cache_hits=(\d+) "
                 r"pareto_labels=(\d+) patrol_labels=(\d+) team_states=(\d+) "
@@ -273,6 +368,7 @@ def main():
         tanker_idle = 0
         fuel_ends = []
         fuel_end_by_agent = {}
+        fuel_used = 0
         road_uses = 0
         road_wait_steps = 0
         end_on_road_routes = 0
@@ -335,6 +431,7 @@ def main():
                 if not moved:
                     idle_patrols += 1
                 fuel_ends.append(fuel)
+                fuel_used += max(0, agent.get("fuel", fuel_limit) - fuel)
                 if fuel <= max(18, fuel_limit // 5):
                     low_fuel += 1
                 fuel_end_by_agent[agent_id] = fuel
@@ -379,19 +476,32 @@ def main():
             if miss > 0
         )
         last_portion_missing = sum(1 for miss, stock, _i in top_missing if miss == 1 and stock >= 4)
-        total += capped
         road_wait_penalty = road_wait_steps // 8
         end_road_penalty = end_on_road_routes // 2
         conservative = max(0, capped - max(0, road_uses // 12) - road_wait_penalty - end_road_penalty - max(0, low_fuel - 1))
-        conservative_total += conservative
         min_fuel_end = min(fuel_ends) if fuel_ends else 0
         quality = stderr_quality.get(day, {})
+        total_patrols = active + idle_patrols
+        if quality.get("has_final_plan_summary"):
+            capped = quality.get("final_assigned_stock", capped)
+            conservative = quality.get("final_server_est", conservative)
+            ghost_visits = quality.get("final_ghost_visits", ghost_visits)
+            active = quality.get("final_active_patrols", active)
+            road_uses = quality.get("final_road_use", road_uses)
+            reachable_today = quality.get("reachable_stock_next_day", reachable_today)
+            idle_patrols = max(0, total_patrols - active)
+        total += capped
+        conservative_total += conservative
         static_vs_server_gap = capped - conservative
         optimistic_capture = int(100 * capped / daily_cap) if daily_cap else 0
         assignment_coverage = optimistic_capture
-        execution_efficiency = int(100 * conservative / max(1, assigned_visits)) if assigned_visits else 100
+        stock_execution_efficiency = int(100 * conservative / max(1, capped)) if capped else 100
+        visit_usefulness = int(100 * capped / max(1, assigned_visits)) if assigned_visits else 100
+        end_to_end_visit_yield = int(100 * conservative / max(1, assigned_visits)) if assigned_visits else 100
+        execution_efficiency = end_to_end_visit_yield
         effective_capture = int(100 * conservative / daily_cap) if daily_cap else 0
         ghost_stock = max(0, capped - conservative)
+        fuel_used_per_portion = fuel_used // max(1, capped)
         duplicate_endpoints = len(patrol_end_positions) - len(set(patrol_end_positions))
         day_rows.append({
             "day": day,
@@ -400,12 +510,17 @@ def main():
             "conservative": conservative,
             "assignment_coverage": assignment_coverage,
             "execution_efficiency": execution_efficiency,
+            "stock_execution_efficiency": stock_execution_efficiency,
+            "visit_usefulness": visit_usefulness,
+            "end_to_end_visit_yield": end_to_end_visit_yield,
             "optimistic_capture": optimistic_capture,
             "effective_capture": effective_capture,
             "ghost_stock": ghost_stock,
+            "fuel_used": fuel_used,
+            "fuel_used_per_portion": fuel_used_per_portion,
             "ghost_visits": ghost_visits,
             "static_vs_server_gap": static_vs_server_gap,
-            "brands": len(brands),
+            "brands": quality.get("final_daily_brands", len(brands)),
             "active": active,
             "idle": idle_patrols,
             "patrols": active + idle_patrols,
@@ -421,6 +536,7 @@ def main():
             "budget_invalid": len(budget_violations),
             "reachable_cap_est": min(daily_cap, reachable_today),
             "negative_slack_routes": quality.get("negative_slack_routes", 0),
+            "negative_slack_final": quality.get("final_negative_slack", quality.get("negative_slack_routes", 0)),
             "road_heavy_routes": quality.get("road_heavy_routes", 0),
             "oversweep_routes": quality.get("oversweep_routes", 0),
             "selected_profile": quality.get("selected_profile"),
@@ -448,21 +564,43 @@ def main():
             "logged_tanker_idle_streak": quality.get("logged_tanker_idle_streak"),
             "last_portion_repairs": quality.get("last_portion_repairs", 0),
             "risk_repairs": quality.get("risk_repairs", 0),
+            "ghost_compressions": quality.get("ghost_compressions", 0),
+            "retry_count": quality.get("retry_count", 0),
+            "cached_plan_returns": quality.get("cached_plan_returns", 0),
+            "debt_duplicate_updates": quality.get("debt_duplicate_updates", 0),
+            "has_final_plan_summary": quality.get("has_final_plan_summary", 0),
+            "serialized_action_hash": quality.get("serialized_action_hash"),
+            "final_team_fuel_risk": quality.get("final_team_fuel_risk"),
+            "final_fuel_opportunity_cost": quality.get("final_fuel_opportunity_cost"),
+            "selected_rollout_policy": quality.get("selected_rollout_policy", ""),
+            "selected_rollout_future_server": quality.get("selected_rollout_future_server", 0),
+            "selected_rollout_total_server": quality.get("selected_rollout_total_server", 0),
+            "selected_rollout_collapse_days": quality.get("selected_rollout_collapse_days", 0),
+            "rollout_future_server": quality.get("rollout_future_server", 0),
+            "rollout_reachable_next": quality.get("rollout_reachable_next", 0),
+            "best_plan_improvement_timeline": quality.get("best_plan_improvement_timeline", []),
         })
         print(
             f"day={day} assigned={assigned_visits} capped={capped}/{daily_cap} conservative={conservative} "
-            f"assignment_coverage={assignment_coverage}% execution_efficiency={execution_efficiency}% "
+            f"assignment_coverage={assignment_coverage}% stock_execution_efficiency={stock_execution_efficiency}% "
+            f"visit_usefulness={visit_usefulness}% end_to_end_visit_yield={end_to_end_visit_yield}% execution_efficiency={execution_efficiency}% "
             f"capture={optimistic_capture}% effective_capture={effective_capture}% ghost_stock={ghost_stock} ghost_visits={ghost_visits} "
-            f"brands={len(brands)} active={active} idle={idle_patrols} "
+            f"fuel_used_per_portion={fuel_used_per_portion} "
+            f"brands={quality.get('final_daily_brands', len(brands))} active={active} idle={idle_patrols} "
             f"missing={missing} low_fuel={low_fuel} min_fuel_end={min_fuel_end} "
             f"road_uses={road_uses} road_wait_steps={road_wait_steps} end_on_road={end_on_road_routes} invalid={len(invalid)} "
             f"route_signature_duplicates={duplicate_endpoints} "
             f"budget_invalid={len(budget_violations)} static_vs_server_gap={static_vs_server_gap} "
             f"negative_slack_routes={quality.get('negative_slack_routes', 0)} "
+            f"negative_slack_final={quality.get('final_negative_slack', quality.get('negative_slack_routes', 0))} "
             f"road_heavy_routes={quality.get('road_heavy_routes', 0)} "
             f"oversweep_routes={quality.get('oversweep_routes', 0)} "
             f"selected_profile={quality.get('selected_profile', '')} "
             f"selected_reason={quality.get('selected_reason', '')} "
+            f"selected_rollout_policy={quality.get('selected_rollout_policy', '')} "
+            f"rollout_future_server={quality.get('selected_rollout_future_server', '')} "
+            f"rollout_total_server={quality.get('selected_rollout_total_server', '')} "
+            f"rollout_collapse_days={quality.get('selected_rollout_collapse_days', '')} "
             f"compute_ms={quality.get('compute_ms', '')} budget_ms={quality.get('budget_ms', '')} "
             f"refuels={quality.get('feasible_refuels', 0)}/{quality.get('planned_refuels', 0)} "
             f"actual_refuels={actual_refuels} tanker_idle={tanker_idle} "
@@ -473,7 +611,10 @@ def main():
             f"fast_low_fuel={quality.get('fast_low_fuel', '')} strong_low_fuel={quality.get('strong_low_fuel', '')} "
             f"fast_debt={quality.get('fast_debt', '')} strong_debt={quality.get('strong_debt', '')} "
             f"last_portion_missing={last_portion_missing} repairs={quality.get('last_portion_repairs', 0)} "
-            f"risk_repairs={quality.get('risk_repairs', 0)} "
+            f"risk_repairs={quality.get('risk_repairs', 0)} ghost_compressions={quality.get('ghost_compressions', 0)} "
+            f"reachable_stock_next_day={quality.get('reachable_stock_next_day', '')} "
+            f"retry_count={quality.get('retry_count', 0)} cached_returns={quality.get('cached_plan_returns', 0)} debt_duplicate_updates={quality.get('debt_duplicate_updates', 0)} "
+            f"final_summary={quality.get('has_final_plan_summary', 0)} action_hash={quality.get('serialized_action_hash', '')} "
             f"top_missing={top_missing_text}"
         )
         if args.rules_check and (invalid or budget_violations):
@@ -551,6 +692,16 @@ def main():
     ghost_visits_total = 0
     route_signature_duplicates_total = 0
     risk_repairs_total = 0
+    cached_plan_returns_total = 0
+    retry_count_total = 0
+    debt_duplicate_updates_total = 0
+    final_negative_slack_total = 0
+    reachable_stock_next_day_total = 0
+    fuel_used_total = 0
+    rollout_policy_counts = {}
+    selected_rollout_future_total = 0
+    selected_rollout_total_total = 0
+    improvement_timeline_parts = []
     for day in range(len(day_steps)):
         quality = stderr_quality.get(day, {})
         profile = quality.get("selected_profile") or ("fast_baseline" if quality.get("fast_only") else "unknown")
@@ -578,6 +729,23 @@ def main():
         ghost_visits_total += row.get("ghost_visits", 0)
         route_signature_duplicates_total += row.get("route_signature_duplicates", 0)
         risk_repairs_total += row.get("risk_repairs", 0)
+        cached_plan_returns_total += row.get("cached_plan_returns", 0)
+        retry_count_total += row.get("retry_count", 0)
+        debt_duplicate_updates_total += row.get("debt_duplicate_updates", 0)
+        final_negative_slack_total += row.get("negative_slack_final", 0)
+        reachable_stock_next_day_total += row.get("reachable_cap_est", 0)
+        fuel_used_total += row.get("fuel_used", 0)
+        if row.get("best_plan_improvement_timeline"):
+            timeline_text = "/".join(
+                f"{item.get('stage')}:{item.get('server', '')}:{item.get('negative_slack', '')}"
+                for item in row.get("best_plan_improvement_timeline", [])
+            )
+            improvement_timeline_parts.append(f"d{row.get('day')}[{timeline_text}]")
+        policy = row.get("selected_rollout_policy")
+        if policy:
+            rollout_policy_counts[policy] = rollout_policy_counts.get(policy, 0) + 1
+        selected_rollout_future_total += row.get("selected_rollout_future_server", 0)
+        selected_rollout_total_total += row.get("selected_rollout_total_server", 0)
         actual_refuels_total += row.get("actual_refuels", 0)
         if row.get("tanker_idle", 0) > 0:
             tanker_idle_days += 1
@@ -595,6 +763,7 @@ def main():
         for profile, values in sorted(profile_compute.items())
         if values
     )
+    rollout_policy_counts_text = ",".join(f"{key}:{value}" for key, value in sorted(rollout_policy_counts.items()))
 
     http_path = base / "http.log"
     bot_ms = []
@@ -674,8 +843,14 @@ def main():
         f"assigned_visits_total={assigned_visits_total} "
         f"estimated_capture_ratio={(int(100 * total / total_cap) if total_cap else 0)}% "
         f"assignment_coverage={(int(100 * total / total_cap) if total_cap else 0)}% "
+        f"stock_execution_efficiency={(int(100 * conservative_total / max(1, total)) if total else 100)}% "
+        f"visit_usefulness={(int(100 * total / max(1, assigned_visits_total)) if assigned_visits_total else 100)}% "
+        f"end_to_end_visit_yield={(int(100 * conservative_total / max(1, assigned_visits_total)) if assigned_visits_total else 100)}% "
         f"execution_efficiency={(int(100 * conservative_total / max(1, assigned_visits_total)) if assigned_visits_total else 100)}% "
         f"effective_capture_ratio={(int(100 * conservative_total / total_cap) if total_cap else 0)}% "
+        f"final_negative_slack_total={final_negative_slack_total} "
+        f"fuel_used_per_portion={(fuel_used_total // max(1, total)) if total else 0} "
+        f"reachable_stock_next_day_total={reachable_stock_next_day_total} "
         f"road_gap_risk={max(0, total - conservative_total)} "
         f"ghost_stock_total={max(0, total - conservative_total)} "
         f"ghost_visits_total={ghost_visits_total} "
@@ -694,10 +869,15 @@ def main():
         f"farm_benchmark_valid={int(farm_benchmark_valid)} "
         f"profile_counts={profile_counts_text} selected_reasons={selected_reasons_text} "
         f"profile_compute={profile_compute_text} "
+        f"rollout_policy_counts={rollout_policy_counts_text} "
+        f"selected_rollout_future_total={selected_rollout_future_total} "
+        f"selected_rollout_total_total={selected_rollout_total_total} "
         f"last_portion_missing={last_portion_missing_total} last_portion_repairs={last_portion_repairs_total} "
         f"risk_repairs={risk_repairs_total} "
         f"road_wait_steps_total={road_wait_steps_total} end_on_road_total={end_on_road_total} "
         f"route_signature_duplicates_total={route_signature_duplicates_total} "
+        f"retry_count={retry_count_total} cached_plan_returns={cached_plan_returns_total} debt_duplicate_updates={debt_duplicate_updates_total} "
+        f"best_plan_improvement_timeline={';'.join(improvement_timeline_parts)} "
         f"setup_assignment_reason={setup_assignment_reason} tanker_value_est={'' if tanker_value_est is None else tanker_value_est} "
         f"strong_rejected_count={strong_rejected_count} strong_over_budget_days={strong_over_budget_days} "
         f"planned_refuels={planned_refuels_total} feasible_refuels={feasible_refuels_total} "
@@ -729,8 +909,15 @@ def main():
             "conservative_total": conservative_total,
             "assigned_visits_total": assigned_visits_total,
             "assignment_coverage": int(100 * total / total_cap) if total_cap else 0,
+            "stock_execution_efficiency": int(100 * conservative_total / max(1, total)) if total else 100,
+            "visit_usefulness": int(100 * total / max(1, assigned_visits_total)) if assigned_visits_total else 100,
+            "end_to_end_visit_yield": int(100 * conservative_total / max(1, assigned_visits_total)) if assigned_visits_total else 100,
             "execution_efficiency": int(100 * conservative_total / max(1, assigned_visits_total)) if assigned_visits_total else 100,
             "effective_capture_ratio": int(100 * conservative_total / total_cap) if total_cap else 0,
+            "final_negative_slack_total": final_negative_slack_total,
+            "fuel_used_per_portion": (fuel_used_total // max(1, total)) if total else 0,
+            "reachable_stock_next_day_total": reachable_stock_next_day_total,
+            "best_plan_improvement_timeline": improvement_timeline_parts,
             "road_gap_risk": max(0, total - conservative_total),
             "ghost_stock_total": max(0, total - conservative_total),
             "ghost_visits_total": ghost_visits_total,
@@ -762,6 +949,9 @@ def main():
             "road_wait_steps_total": road_wait_steps_total,
             "end_on_road_total": end_on_road_total,
             "route_signature_duplicates_total": route_signature_duplicates_total,
+            "retry_count": retry_count_total,
+            "cached_plan_returns": cached_plan_returns_total,
+            "debt_duplicate_updates": debt_duplicate_updates_total,
             "profile_compute": {
                 profile: {
                     "avg_ms": int(sum(values) / len(values)),
