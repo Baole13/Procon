@@ -198,6 +198,14 @@ def main():
                 day = int(brand_constraint_match.group(1))
                 if day in stderr_quality:
                     stderr_quality[day]["brand_max_reachable"] = int(brand_constraint_match.group(2))
+            stage_timing_match = re.search(r"stage_timing day=(\d+) (.*)", line)
+            if stage_timing_match:
+                day = int(stage_timing_match.group(1))
+                if day in stderr_quality:
+                    pairs = dict((key, int(value)) for key, value in re.findall(r"([a-z_]+)=(-?\d+)", stage_timing_match.group(2)))
+                    for key in ("cluster_ms", "route_gen_ms", "set_packing_ms", "rollout_ms", "hub_forecast_ms"):
+                        if key in pairs:
+                            stderr_quality[day][key] = pairs[key]
             set_packing_match = re.search(r"set_packing day=(\d+) .*states=(\d+).*selected_exact=(\d+).*selected_brands=(\d+).*interrupted=(\d+)", line)
             if set_packing_match:
                 day = int(set_packing_match.group(1))
@@ -791,6 +799,7 @@ def main():
             f"rollout_total_server={quality.get('selected_rollout_total_server', '')} "
             f"rollout_collapse_days={quality.get('selected_rollout_collapse_days', '')} "
             f"compute_ms={quality.get('compute_ms', '')} budget_ms={quality.get('budget_ms', '')} "
+            f"stage_ms={quality.get('cluster_ms', '')}/{quality.get('route_gen_ms', '')}/{quality.get('set_packing_ms', '')}/{quality.get('rollout_ms', '')} "
             f"refuels={quality.get('feasible_refuels', 0)}/{quality.get('planned_refuels', 0)} "
             f"actual_refuels={actual_refuels} tanker_idle={tanker_idle} "
             f"position_mismatch={position_mismatch} fuel_mismatch={fuel_mismatch} "

@@ -249,7 +249,13 @@ struct SetupForecast {
     int idlePenalty = 0;
     int runtimeRequests = 0;
     int idleAfterRepair = 0;
+    int hubCandidateCount = 0;
+    int hubBestPos = -1;
+    int hubSharedSteps = 0;
+    int hubSavedFuel = 0;
+    int hubServerBonus = 0;
     bool verifiedFuelHorizon = false;
+    bool hubCounterfactual = false;
 };
 
 enum class PlanProfile {
@@ -340,6 +346,7 @@ struct GameState {
     bool ultraFastMode = false;
     int hardBudgetMs = 0;
     string stateHash;
+    int preferredTankerHub = -1;
 
     int nodeCount() const { return width * height; }
     int dayBudget() const {
@@ -470,7 +477,8 @@ static TimeProfile selectTimeProfile() {
         return TimeProfile::Normal;
     }
     if (available < 500) return TimeProfile::Fast;
-    if (available <= 8000) return TimeProfile::Normal;
+    if (available <= 2000) return TimeProfile::Normal;
+    if (available <= 8000 && selectMapFamily() == MapFamily::L24) return TimeProfile::Normal;
     return TimeProfile::Deep;
 }
 
@@ -696,8 +704,8 @@ static PlannerConfig makePlannerConfig(const vector<Agent>& agents) {
     }
     if (G.hardBudgetMs > 0) {
         int hardBudget = max(10, G.hardBudgetMs);
-        int stableBenchmarkBudget = cfg.timeProfile == TimeProfile::Long ? (large ? 4500 : 3000) :
-            (large ? 1600 : 1000);
+        int stableBenchmarkBudget = cfg.timeProfile == TimeProfile::Long ? (large ? 4500 : (medium16 ? 3000 : 2200)) :
+            (large ? 1600 : (medium16 ? 1800 : 1000));
         cfg.computeBudgetMs = min(hardBudget, stableBenchmarkBudget);
     }
     int daysAfterToday = max(0, (int)G.daySteps.size() - G.day - 1);
@@ -708,9 +716,17 @@ static PlannerConfig makePlannerConfig(const vector<Agent>& agents) {
     if (medium16) {
         cfg.futureFuelLambda = max(cfg.futureFuelLambda, 2);
         cfg.clusterQuotaStrictness = max(cfg.clusterQuotaStrictness, 2);
+        if (cfg.timeProfile != TimeProfile::Fast && daysAfterToday >= 2 && cfg.fuelRatio < 0.75) {
+            cfg.futureFuelLambda = max(cfg.futureFuelLambda, 3);
+            cfg.minEndFuelReserve = max(cfg.minEndFuelReserve, max(LOW_FUEL_ROUTE_LIMIT, G.fuelLimit / 3));
+        }
     } else if (large24) {
         cfg.futureFuelLambda = max(cfg.futureFuelLambda, 3);
         cfg.clusterQuotaStrictness = max(cfg.clusterQuotaStrictness, 3);
+        if (G.day == 0 && cfg.fuelRatio > 0.80) {
+            cfg.futureFuelLambda = max(1, cfg.futureFuelLambda - 1);
+            cfg.minEndFuelReserve = max(LOW_FUEL_ROUTE_LIMIT, G.fuelLimit / 5);
+        }
     } else if (maxLarge) {
         cfg.futureFuelLambda = max(cfg.futureFuelLambda, 4);
         cfg.clusterQuotaStrictness = max(cfg.clusterQuotaStrictness, 4);
@@ -1433,6 +1449,12 @@ static int spotDeficitGainOfRoute(const Route& route, const vector<int>& deficit
 static int estimateFutureFuelDebt(const Route& route, const vector<Cluster>& clusters) {
     if (G.day + 1 >= (int)G.daySteps.size()) return 0;
     int safeFuel = max(G.fuelLimit / 3, 35);
+    if (CURRENT_CONFIG.timeProfile != TimeProfile::Fast && CURRENT_CONFIG.mapFamily == MapFamily::M16 && CURRENT_CONFIG.daysLeft >= 3) {
+        safeFuel = max(safeFuel, G.fuelLimit / 2);
+    }
+    if (CURRENT_CONFIG.mapFamily == MapFamily::L24 && G.day == 0 && CURRENT_CONFIG.fuelRatio > 0.80) {
+        safeFuel = max(LOW_FUEL_ROUTE_LIMIT, G.fuelLimit / 5);
+    }
     int debt = max(0, safeFuel - route.fuelLeft);
     if (!clusters.empty()) {
         DijkstraResult paths = dijkstraFrom(route.endPos);
@@ -2076,6 +2098,65 @@ static Route routeToSpot(const Agent& agent, const Spot& target, int dayBudget) 
     return simulateRoute(agent, actions, dayBudget);
 }
 
+static Route routeThroughPositions(const Agent& agent, const vector<int>& targets, int dayBudget) {
+    vector<int> actions;
+    int cur = agent.pos;
+    int used = 0;
+    int fuel = agent.fuel;
+    for (int targetPos : targets) {
+        if (!inBounds(targetPos)) continue;
+        vector<int> path = shortestPath(cur, targetPos);
+        for (int nxt : path) {
+            MoveCost cost = moveCost(cur);
+            int dir = dirTo(cur, nxt);
+            if (dir < 0 || !cost.passable) return simulateRoute(agent, actions, dayBudget);
+            int fuelCost = agent.kind == 1 ? 0 : cost.fuel;
+            if (used + cost.steps > dayBudget || fuel < fuelCost) return simulateRoute(agent, actions, dayBudget);
+            actions.push_back(dir);
+            used += cost.steps;
+            fuel -= fuelCost;
+            cur = nxt;
+        }
+    }
+    return simulateRoute(agent, actions, dayBudget);
+}
+
+static Route generateRouteViaHub(const Agent& agent, int hubPos, int dayBudget) {
+    if (!inBounds(hubPos)) return simulateRoute(agent, {}, dayBudget);
+    DijkstraResult fromStart = dijkstraFrom(agent.pos);
+    DijkstraResult toHub = dijkstraFrom(hubPos);
+    int bestSid = -1;
+    long long bestRank = LLONG_MIN;
+    for (const Spot& spot : G.spots) {
+        int toSpot = fromStart.dist[spot.pos];
+        int spotToHub = toHub.dist[spot.pos];
+        int fuelToSpot = fromStart.fuel[spot.pos];
+        int fuelSpotToHub = toHub.fuel[spot.pos];
+        if (toSpot >= INF || spotToHub >= INF || fuelToSpot >= INF || fuelSpotToHub >= INF) continue;
+        if (toSpot + spotToHub + 1 > dayBudget) continue;
+        if (fuelToSpot + fuelSpotToHub > agent.fuel) continue;
+        int stock = max(1, spot.amount);
+        int debt = spotDebt(spot.id);
+        long long rank =
+            8000LL * stock +
+            6000LL * debt +
+            200000LL * (!G.globalBrandsSeen.count(spot.brand) ? 1 : 0) -
+            70LL * (toSpot + spotToHub) -
+            90LL * (fuelToSpot + fuelSpotToHub);
+        if (rank > bestRank) {
+            bestRank = rank;
+            bestSid = spot.id;
+        }
+    }
+    if (bestSid >= 0) return routeThroughPositions(agent, {G.spots[bestSid].pos, hubPos}, dayBudget);
+    Spot pseudo;
+    pseudo.id = -1;
+    pseudo.pos = hubPos;
+    pseudo.brand = -1;
+    pseudo.amount = 0;
+    return routeToSpot(agent, pseudo, dayBudget);
+}
+
 static PlanEval evaluatePlanForSelection(const vector<vector<int>>& plan, const vector<Agent>& agents, int dayBudget) {
     PlanEval eval;
     TeamSimulation team = simulateTeamPlan(plan, agents, dayBudget);
@@ -2521,6 +2602,11 @@ static Route generateRouteForMode(const Agent& agent, int mode, int dayBudget, c
             bool newLocalBrand = !localBrands.count(spot.brand);
             if (!finalDay && CURRENT_CONFIG.daysLeft >= 2 && CURRENT_CONFIG.fuelRatio < 0.65 && !newLocalBrand) {
                 int futureBuffer = max(LOW_FUEL_ROUTE_LIMIT, G.fuelLimit / 3);
+                if (CURRENT_CONFIG.timeProfile != TimeProfile::Fast && CURRENT_CONFIG.mapFamily == MapFamily::M16 && CURRENT_CONFIG.daysLeft >= 3) {
+                    futureBuffer = max(futureBuffer, G.fuelLimit / 2);
+                } else if (CURRENT_CONFIG.mapFamily == MapFamily::L24 && G.day == 0 && CURRENT_CONFIG.fuelRatio > 0.80) {
+                    futureBuffer = max(LOW_FUEL_ROUTE_LIMIT, G.fuelLimit / 5);
+                }
                 if (fuelLeft - fuel < futureBuffer) continue;
             }
 
@@ -2709,19 +2795,20 @@ static vector<int> buildBeamSpotCandidates(const Agent& agent, const vector<Clus
         int f = fromAgent.fuel[spot.pos];
         if (d >= INF || f > agent.fuel) continue;
         int stock = max(1, spot.amount);
+        bool xl32 = CURRENT_CONFIG.mapFamily == MapFamily::XL32;
         int score =
             700 * stock +
             220 * desiredQuotaForSpot((int)sid) +
-            90 * spotDebt((int)sid) +
+            (xl32 ? 170 : 90) * spotDebt((int)sid) +
             (clusterEntry.count((int)sid) ? 350 : 0) +
-            (d > G.dayBudget() / 3 ? 180 : 0) -
-            12 * d -
+            (d > G.dayBudget() / 3 ? (xl32 ? 620 : 180) : 0) -
+            (xl32 ? 7 : 12) * d -
             8 * f;
         ranked.push_back({score, (int)sid});
     }
     sort(ranked.rbegin(), ranked.rend());
     vector<int> result;
-    int limit = min((int)ranked.size(), isLargeMap() ? 12 : 10);
+    int limit = min((int)ranked.size(), CURRENT_CONFIG.mapFamily == MapFamily::XL32 ? 16 : (isLargeMap() ? 12 : 10));
     if (G.dayBudget() <= 40) limit = min((int)ranked.size(), 8);
     for (int i = 0; i < limit; ++i) result.push_back(ranked[i].second);
     return result;
@@ -3066,12 +3153,14 @@ static vector<vector<RouteCandidate>> generateRoutePools(const vector<Agent>& ag
         }
         if (bestDist >= INF) continue;
         int stock = max(1, G.spots[sid].amount);
+        bool xl32 = CURRENT_CONFIG.mapFamily == MapFamily::XL32;
         int score =
             180 * stock +
             120 * spotDebt((int)sid) +
-            bestDist +
+            (xl32 ? 260 : 1) * bestDist +
             (stock >= 3 ? 350 : 0) +
-            (isLargeMap() && bestDist > dayBudget / 3 ? 180 : 0);
+            (isLargeMap() && bestDist > dayBudget / 3 ? (xl32 ? 900 : 180) : 0) +
+            (xl32 ? 240 * desiredQuotaForSpot((int)sid) : 0);
         remoteTargets.push_back({score, (int)sid});
     }
     sort(remoteTargets.rbegin(), remoteTargets.rend());
@@ -3114,7 +3203,7 @@ static vector<vector<RouteCandidate>> generateRoutePools(const vector<Agent>& ag
                 if (find(heavyTargets.begin(), heavyTargets.end(), sid) == heavyTargets.end()) heavyTargets.push_back(sid);
             }
         }
-        int targetLimit = heavyLimit + (isLargeMap() ? 7 : 3);
+        int targetLimit = heavyLimit + (isLargeMap() ? (CURRENT_CONFIG.mapFamily == MapFamily::XL32 ? 10 : 7) : 3);
         if (G.spots.size() <= 12) targetLimit = (int)G.spots.size();
         for (int sid : topDebtSpotIds(isLargeMap() ? 4 : 3)) {
             if ((int)heavyTargets.size() >= targetLimit) break;
@@ -3131,6 +3220,20 @@ static vector<vector<RouteCandidate>> generateRoutePools(const vector<Agent>& ag
             if (route.valid && route.stepsUsed > 0) {
                 RouteCandidate candidate = makeCandidate(agent, route, ROUTE_MODES + 1, dayBudget, emptyRoadUse, clusters, deficits, agents);
                 if (!candidate.truncated) pools[agent.id].push_back(std::move(candidate));
+            }
+        }
+
+        if (G.preferredTankerHub >= 0 && CURRENT_CONFIG.refuels > 0 && !plannerTimeExceeded(max(4, plannerBudgetMs() / 8))) {
+            Route hubRoute = generateRouteViaHub(agent, G.preferredTankerHub, dayBudget);
+            if (hubRoute.valid && hubRoute.stepsUsed > 0) {
+                RouteCandidate candidate = makeCandidate(agent, hubRoute, ROUTE_MODES + 3, dayBudget, emptyRoadUse, clusters, deficits, agents);
+                candidate.refuelReachable = true;
+                candidate.refuelWindowStart = hubRoute.stepsUsed;
+                candidate.refuelWindowEnd = dayBudget;
+                candidate.refuelWindowPos = G.preferredTankerHub;
+                candidate.clusterQuotaGain += 350;
+                candidate.conservativeScore += 1800 + 20 * max(0, dayBudget - hubRoute.stepsUsed);
+                pools[agent.id].push_back(std::move(candidate));
             }
         }
 
@@ -3163,7 +3266,9 @@ static vector<vector<RouteCandidate>> generateRoutePools(const vector<Agent>& ag
                 if (candidate.fuelEnd >= max(G.fuelLimit / 2, LOW_FUEL_ROUTE_LIMIT)) keptFuelSafe = true;
                 if (candidate.mode == 16) keptRoadLight = true;
             }
-            int desiredClusterCoverage = isLargeMap() ? min((int)clusters.size(), max(2, CURRENT_CONFIG.patrols / 2)) : 0;
+            int desiredClusterCoverage = isLargeMap()
+                ? min((int)clusters.size(), max(2, CURRENT_CONFIG.mapFamily == MapFamily::XL32 ? CURRENT_CONFIG.patrols - 1 : CURRENT_CONFIG.patrols / 2))
+                : 0;
             bool enoughClusterCoverage = !isLargeMap() || (int)endpointClustersKept.size() >= desiredClusterCoverage;
             if ((int)pruned.size() >= adaptivePoolLimit(dayBudget) && enoughClusterCoverage) break;
         }
@@ -3339,12 +3444,13 @@ static vector<Route> combineRoutesStockAware(const vector<Agent>& agents, const 
                 ns.eval.clusterQuotaGain += delta.clusterQuotaGain;
                 ns.eval.fuelRisk += delta.fuelRisk;
                 int debtWeight = ((int)G.daySteps.size() >= 6 && G.day + 1 < (int)G.daySteps.size()) ? 2 : 1;
+                if (CURRENT_CONFIG.mapFamily == MapFamily::M16 && CURRENT_CONFIG.daysLeft >= 3) debtWeight = max(debtWeight, 3);
                 ns.eval.fuelRisk += debtWeight * delta.futureFuelDebt;
                 ns.eval.roadPenalty += delta.roadPenalty;
                 if (choice.clusterIdEnd >= 0 && choice.clusterIdEnd < (int)ns.endpointClusterUse.size()) {
                     int alreadyThere = ns.endpointClusterUse[choice.clusterIdEnd]++;
                     if (alreadyThere > 0 && choice.route.stepsUsed > 0 && delta.remoteDeficitGain <= 0) {
-                        ns.eval.roadPenalty += isLargeMap() ? 8 * alreadyThere : 4 * alreadyThere;
+                        ns.eval.roadPenalty += (CURRENT_CONFIG.mapFamily == MapFamily::XL32 ? 20 : (isLargeMap() ? 12 : 4)) * alreadyThere;
                     }
                 }
                 if (G.day + 1 < (int)G.daySteps.size()) {
@@ -3440,12 +3546,13 @@ static vector<Route> combineRoutesStockAware(const vector<Agent>& agents, const 
             greedy.eval.clusterQuotaGain += bestEval.clusterQuotaGain;
             greedy.eval.fuelRisk += bestEval.fuelRisk;
             int debtWeight = ((int)G.daySteps.size() >= 6 && G.day + 1 < (int)G.daySteps.size()) ? 2 : 1;
+            if (CURRENT_CONFIG.mapFamily == MapFamily::M16 && CURRENT_CONFIG.daysLeft >= 3) debtWeight = max(debtWeight, 3);
             greedy.eval.fuelRisk += debtWeight * bestEval.futureFuelDebt;
             greedy.eval.roadPenalty += bestEval.roadPenalty;
             if (choice.clusterIdEnd >= 0 && choice.clusterIdEnd < (int)greedy.endpointClusterUse.size()) {
                 int alreadyThere = greedy.endpointClusterUse[choice.clusterIdEnd]++;
                 if (alreadyThere > 0 && choice.route.stepsUsed > 0 && bestEval.remoteDeficitGain <= 0) {
-                    greedy.eval.roadPenalty += isLargeMap() ? 8 * alreadyThere : 4 * alreadyThere;
+                    greedy.eval.roadPenalty += (CURRENT_CONFIG.mapFamily == MapFamily::XL32 ? 20 : (isLargeMap() ? 12 : 4)) * alreadyThere;
                 }
             }
             if (G.day + 1 < (int)G.daySteps.size()) {
@@ -3504,19 +3611,46 @@ static vector<Route> combineRoutesStockAware(const vector<Agent>& agents, const 
         bool dfsFoundFeasible = false;
         vector<BeamState> topLeaves;
         BeamState current = initial;
-        int choiceLimit = isLargeMap() ? 5 : 6;
+        int choiceLimit = CURRENT_CONFIG.mapFamily == MapFamily::XL32 ? 6 : (isLargeMap() ? 5 : 6);
         int exactRescoreLimit = max(16, CURRENT_CONFIG.setPackingTopK);
         if (G.deadlineMarginMs >= 0 && G.deadlineMarginMs < 1200) exactRescoreLimit = min(exactRescoreLimit, 64);
         if (CURRENT_CONFIG.mapFamily == MapFamily::S8 && CURRENT_CONFIG.timeProfile != TimeProfile::Fast) {
             exactRescoreLimit = max(exactRescoreLimit, 256);
         }
+        auto leafSignature = [&](const BeamState& leaf) {
+            int stockMask = 0;
+            int clusterMask = 0;
+            for (const Route& route : leaf.selected) {
+                if (!route.valid || route.stepsUsed <= 0) continue;
+                for (int sid : route.visitedSpots) {
+                    if (sid < 0 || sid >= (int)G.spots.size()) continue;
+                    if (sid < 20 && (G.spots[sid].amount >= 3 || spotDebt(sid) > 0)) stockMask |= (1 << sid);
+                }
+            }
+            for (size_t i = 0; i < leaf.endpointClusterUse.size() && i < 12; ++i) {
+                if (leaf.endpointClusterUse[i] > 0) clusterMask |= (1 << i);
+            }
+            ostringstream oss;
+            oss << stockMask << ":" << clusterMask << ":" << leaf.eval.dailyBrands << ":" << leaf.eval.cappedPortions / 2;
+            return oss.str();
+        };
         auto keepTopLeaf = [&](const BeamState& leaf) {
             topLeaves.push_back(leaf);
             sort(topLeaves.begin(), topLeaves.end(), [&](const BeamState& a, const BeamState& b) {
                 return betterTeamState(a, b);
             });
+            map<string,int> perSignature;
+            vector<BeamState> diverse;
+            int maxPerSignature = CURRENT_CONFIG.mapFamily == MapFamily::XL32 ? 2 : 3;
             int keep = min((int)topLeaves.size(), exactRescoreLimit * 3);
-            if ((int)topLeaves.size() > keep) topLeaves.resize(keep);
+            for (const BeamState& state : topLeaves) {
+                string sig = leafSignature(state);
+                if (perSignature[sig] >= maxPerSignature) continue;
+                perSignature[sig]++;
+                diverse.push_back(state);
+                if ((int)diverse.size() >= keep) break;
+            }
+            topLeaves.swap(diverse);
         };
         function<void(int)> dfs = [&](int idx) {
             if (setPackingStates >= 12000 || plannerTimeExceeded(4)) {
@@ -3549,7 +3683,7 @@ static vector<Route> combineRoutesStockAware(const vector<Agent>& agents, const 
                 if (choice.clusterIdEnd >= 0 && choice.clusterIdEnd < (int)current.endpointClusterUse.size()) {
                     int alreadyThere = current.endpointClusterUse[choice.clusterIdEnd]++;
                     if (alreadyThere > 0 && choice.route.stepsUsed > 0 && delta.remoteDeficitGain <= 0) {
-                        current.eval.roadPenalty += isLargeMap() ? 10 * alreadyThere : 5 * alreadyThere;
+                        current.eval.roadPenalty += (CURRENT_CONFIG.mapFamily == MapFamily::XL32 ? 24 : (isLargeMap() ? 12 : 5)) * alreadyThere;
                     }
                 }
                 for (int sid : choice.route.visitedSpots) {
@@ -3897,6 +4031,10 @@ static Route planRefuelRoute(
             targets.push_back({G.spots[sid].pos, zonePriority + 500LL * G.spots[sid].amount + 900LL * spotDebt(sid), dayBudget});
         }
     }
+    if (G.preferredTankerHub >= 0) {
+        long long hubPriority = hasFuelRequest ? 2600000LL : 1500000LL;
+        targets.push_back({G.preferredTankerHub, hubPriority, dayBudget});
+    }
     for (const RefuelRequest& request : requests) {
         set<int> seenPositions;
         for (int pos : request.meetPositions) {
@@ -3992,7 +4130,8 @@ static vector<vector<int>> combineRoutesDiversityFirst(const vector<Agent>& agen
                 }
             }
         }
-        string tankerReason = hasUrgentRequest ? "low_fuel" : (refuelRoute.stepsUsed > 0 ? (endsNearDebt ? "debt_cluster" : "stock_cluster") : "idle");
+        bool endsAtHub = G.preferredTankerHub >= 0 && refuelRoute.endPos == G.preferredTankerHub;
+        string tankerReason = hasUrgentRequest ? "low_fuel" : (refuelRoute.stepsUsed > 0 ? (endsAtHub ? "tanker_hub" : (endsNearDebt ? "debt_cluster" : "stock_cluster")) : "idle");
         if (tankerReason == "idle") G.tankerIdleStreak++;
         else G.tankerIdleStreak = 0;
         cerr << "refuel day=" << G.day
@@ -4003,6 +4142,7 @@ static vector<vector<int>> combineRoutesDiversityFirst(const vector<Agent>& agen
              << " actions=" << refuelRoute.actions.size()
              << " requests=" << requests.size()
              << " service_zone=" << chooseRefuelServiceZone(requests, clusters)
+             << " preferred_hub=" << G.preferredTankerHub
              << " tanker_reason=" << tankerReason
              << " tanker_idle_streak=" << G.tankerIdleStreak
              << "\n";
@@ -5454,6 +5594,7 @@ static vector<vector<int>> planDay(const vector<Agent>& agents) {
 
     auto strongStarted = chrono::steady_clock::now();
     vector<Cluster> clusters = buildClusters(agents);
+    auto clustersDone = chrono::steady_clock::now();
     int cap = stockCap();
     cerr << "map_metrics day=" << G.day
          << " clusters=" << clusters.size()
@@ -5467,7 +5608,9 @@ static vector<vector<int>> planDay(const vector<Agent>& agents) {
     cerr << "\n";
 
     vector<vector<RouteCandidate>> pools = generateRoutePools(agents, dayBudget, clusters);
+    auto poolsDone = chrono::steady_clock::now();
     vector<Route> routes = combineRoutesStockAware(agents, pools, dayBudget);
+    auto combineDone = chrono::steady_clock::now();
     vector<vector<int>> strongPlan =
         combineRoutesDiversityFirst(agents, routes, clusters, dayBudget);
     if (!validatePlan(strongPlan, agents, dayBudget)) {
@@ -5588,6 +5731,7 @@ static vector<vector<int>> planDay(const vector<Agent>& agents) {
     bool canTryRolloutPolicies = G.day + 1 < (int)G.daySteps.size() &&
         !CURRENT_CONFIG.ultraFastMode &&
         !plannerTimeExceeded(max(55, plannerBudgetMs() / 3));
+    auto rolloutStarted = chrono::steady_clock::now();
     if (canTryRolloutPolicies) {
         PlannerConfig savedConfig = CURRENT_CONFIG;
         for (FuelPolicy policy : {FuelPolicy::BalancedFuel, FuelPolicy::ConservativeFuel}) {
@@ -5614,6 +5758,7 @@ static vector<vector<int>> planDay(const vector<Agent>& agents) {
         }
         CURRENT_CONFIG = savedConfig;
     }
+    auto rolloutDone = chrono::steady_clock::now();
 
     RolloutPlanCandidate bestRollout = rolloutCandidates.front();
     for (const RolloutPlanCandidate& candidate : rolloutCandidates) {
@@ -5667,6 +5812,13 @@ static vector<vector<int>> planDay(const vector<Agent>& agents) {
         chrono::steady_clock::now() - started).count();
     int strongMs = (int)chrono::duration_cast<chrono::milliseconds>(
         chrono::steady_clock::now() - strongStarted).count();
+    cerr << "stage_timing day=" << G.day
+         << " cluster_ms=" << chrono::duration_cast<chrono::milliseconds>(clustersDone - strongStarted).count()
+         << " route_gen_ms=" << chrono::duration_cast<chrono::milliseconds>(poolsDone - clustersDone).count()
+         << " set_packing_ms=" << chrono::duration_cast<chrono::milliseconds>(combineDone - poolsDone).count()
+         << " rollout_ms=" << chrono::duration_cast<chrono::milliseconds>(rolloutDone - rolloutStarted).count()
+         << " hub_forecast_ms=0"
+         << "\n";
     cerr << "planner_timing day=" << G.day
          << " compute_ms=" << computeMs
          << " budget_ms=" << plannerBudgetMs()
@@ -5691,6 +5843,164 @@ static string serializePlan(const vector<vector<int>>& plan) {
     }
     out << "]";
     return out.str();
+}
+
+static vector<int> buildTankerHubCandidates(const vector<int>& startPositions, int limit) {
+    vector<pair<long long,int>> ranked;
+    set<int> seen;
+    auto addCandidate = [&](int pos, long long score) {
+        if (!inBounds(pos) || terrainAt(pos) == 2 || !seen.insert(pos).second) return;
+        ranked.push_back({score, pos});
+    };
+
+    vector<int> byValue(G.spots.size());
+    iota(byValue.begin(), byValue.end(), 0);
+    sort(byValue.begin(), byValue.end(), [](int a, int b) {
+        long long va = 100LL * max(1, G.spots[a].amount) + 80LL * spotDebt(a);
+        long long vb = 100LL * max(1, G.spots[b].amount) + 80LL * spotDebt(b);
+        if (va != vb) return va > vb;
+        return G.spots[a].id < G.spots[b].id;
+    });
+    for (int sid : byValue) {
+        const Spot& spot = G.spots[sid];
+        long long score = 100000LL + 3000LL * max(1, spot.amount) + 2000LL * spotDebt(sid);
+        addCandidate(spot.pos, score);
+        for (int d = 0; d < 6; ++d) {
+            int nb = neighbor(spot.pos, d);
+            if (terrainAt(nb) != 1) addCandidate(nb, score - 200);
+        }
+        if ((int)ranked.size() >= limit * 3) break;
+    }
+
+    if (!G.spots.empty()) {
+        int weightedR = 0;
+        int weightedC = 0;
+        int weightSum = 0;
+        for (const Spot& spot : G.spots) {
+            int w = max(1, spot.amount) + max(0, spotDebt(spot.id));
+            weightedR += (spot.pos / G.width) * w;
+            weightedC += (spot.pos % G.width) * w;
+            weightSum += w;
+        }
+        int centerR = weightSum ? weightedR / weightSum : G.height / 2;
+        int centerC = weightSum ? weightedC / weightSum : G.width / 2;
+        int bestPos = -1;
+        int bestDist = INF;
+        for (int pos = 0; pos < G.nodeCount(); ++pos) {
+            if (terrainAt(pos) == 2) continue;
+            int metric = abs(pos / G.width - centerR) + abs(pos % G.width - centerC) + (terrainAt(pos) == 1 ? 2 : 0);
+            if (metric < bestDist) {
+                bestDist = metric;
+                bestPos = pos;
+            }
+        }
+        if (bestPos >= 0) addCandidate(bestPos, 90000);
+    }
+
+    sort(ranked.rbegin(), ranked.rend());
+    vector<int> result;
+    for (const auto& item : ranked) {
+        if ((int)result.size() >= limit) break;
+        result.push_back(item.second);
+    }
+    return result;
+}
+
+static void applyTankerHubCounterfactual(
+    SetupForecast& forecast,
+    const vector<int>& startPositions,
+    const vector<int>& tankerChosen
+) {
+    int tankerId = -1;
+    for (int i = 0; i < (int)tankerChosen.size(); ++i) {
+        if (tankerChosen[i]) {
+            tankerId = i;
+            break;
+        }
+    }
+    if (tankerId < 0 || tankerId >= (int)startPositions.size() || G.daySteps.empty()) return;
+    int savedDay = G.day;
+    G.day = 0;
+    int dayBudget = G.dayBudget();
+    vector<int> hubs = buildTankerHubCandidates(startPositions, 4);
+    forecast.hubCandidateCount = (int)hubs.size();
+    DijkstraResult tankerPaths = dijkstraFrom(startPositions[tankerId]);
+
+    int bestHub = -1;
+    long long bestRank = LLONG_MIN;
+    int bestShared = 0;
+    int bestSavedFuel = 0;
+    int bestPortions = 0;
+
+    for (int hub : hubs) {
+        int tankerTravel = tankerPaths.dist[hub];
+        if (tankerTravel >= INF || tankerTravel > dayBudget) continue;
+        DijkstraResult hubPaths = dijkstraFrom(hub);
+        int shared = 0;
+        int savedFuel = 0;
+        int portions = 0;
+        int brandMask = 0;
+        for (int i = 0; i < (int)startPositions.size(); ++i) {
+            if (i == tankerId || (i < (int)tankerChosen.size() && tankerChosen[i])) continue;
+            DijkstraResult patrolPaths = dijkstraFrom(startPositions[i]);
+            long long bestPatrol = LLONG_MIN;
+            int bestFuelUse = 0;
+            int bestBrand = -1;
+            for (const Spot& spot : G.spots) {
+                int toSpot = patrolPaths.dist[spot.pos];
+                int spotToHub = hubPaths.dist[spot.pos];
+                int fuelToSpot = patrolPaths.fuel[spot.pos];
+                int fuelSpotToHub = hubPaths.fuel[spot.pos];
+                if (toSpot >= INF || spotToHub >= INF || fuelToSpot >= INF || fuelSpotToHub >= INF) continue;
+                int steps = toSpot + spotToHub;
+                int fuel = fuelToSpot + fuelSpotToHub;
+                if (steps + 1 > dayBudget || fuel > G.fuelLimit) continue;
+                int stock = max(1, spot.amount);
+                long long rank =
+                    10000LL * stock +
+                    8000LL * spotDebt(spot.id) +
+                    60000LL * ((brandMask & (1 << min(29, max(0, spot.brand)))) ? 0 : 1) -
+                    60LL * steps -
+                    100LL * fuel;
+                if (rank > bestPatrol) {
+                    bestPatrol = rank;
+                    bestFuelUse = fuel;
+                    bestBrand = spot.brand;
+                }
+            }
+            if (bestPatrol > LLONG_MIN / 4) {
+                shared++;
+                portions += 1;
+                savedFuel += max(0, G.fuelLimit - bestFuelUse);
+                if (bestBrand >= 0 && bestBrand < 30) brandMask |= (1 << bestBrand);
+            }
+        }
+        long long rank =
+            1000000LL * shared +
+            70000LL * __builtin_popcount((unsigned)brandMask) +
+            40000LL * portions +
+            70LL * savedFuel -
+            1200LL * tankerTravel;
+        if (rank > bestRank) {
+            bestRank = rank;
+            bestHub = hub;
+            bestShared = shared;
+            bestSavedFuel = savedFuel;
+            bestPortions = portions;
+        }
+    }
+    if (bestHub >= 0) {
+        forecast.hubBestPos = bestHub;
+        forecast.hubSharedSteps = bestShared;
+        forecast.hubSavedFuel = bestSavedFuel;
+        forecast.hubServerBonus = bestPortions;
+        forecast.hubCounterfactual = bestShared >= 2;
+        if (forecast.hubCounterfactual) {
+            forecast.tankerIdleDays = min(forecast.tankerIdleDays, 1);
+            forecast.feasibleRefuels = max(forecast.feasibleRefuels, bestShared);
+        }
+    }
+    G.day = savedDay;
 }
 
 static SetupForecast forecastSetupAssignment(
@@ -5779,6 +6089,7 @@ static SetupForecast forecastSetupAssignment(
         }
     }
     if (forecast.minFuelEnd == INF) forecast.minFuelEnd = 0;
+    if (tankerCount > 0) applyTankerHubCounterfactual(forecast, startPositions, tankerChosen);
     forecast.idlePenalty = 2 * forecast.tankerIdleDays;
     G.day = savedDay;
     G.spotMissDebt = savedDebt;
@@ -5810,6 +6121,7 @@ static void handleSetup(const mj::Value& m) {
     }
     G.spotMissDebt.assign(G.spots.size(), 0);
     G.tankerIdleStreak = 0;
+    G.preferredTankerHub = -1;
 
     G.daySteps.clear();
     for (size_t i = 0; i < m["daySteps"].size(); ++i) G.daySteps.push_back(m["daySteps"][i].asInt());
@@ -5881,8 +6193,11 @@ static void handleSetup(const mj::Value& m) {
     sort(refuelRank.begin(), refuelRank.end());
     string selectedAssignmentReason = s8AllPatrolDefault ? "s8_all_patrol" : "default";
     if (!s8AllPatrolDefault && nAgents >= 6 && (int)G.daySteps.size() >= 4 && refuelCount <= 1 && !refuelRank.empty()) {
+        auto setupForecastStarted = chrono::steady_clock::now();
         SetupForecast allForecast = forecastSetupAssignment(startPositions, refuelRank, 0);
         SetupForecast tankerForecast = forecastSetupAssignment(startPositions, refuelRank, 1);
+        int setupForecastMs = (int)chrono::duration_cast<chrono::milliseconds>(
+            chrono::steady_clock::now() - setupForecastStarted).count();
         tankerForecast.savedPortions = tankerForecast.serverEst - allForecast.serverEst;
         bool allFuelOk =
             allForecast.minFuelEnd >= max(G.fuelLimit / 5, LOW_FUEL_ROUTE_LIMIT) &&
@@ -5894,8 +6209,11 @@ static void handleSetup(const mj::Value& m) {
             allForecast.teamFuelRisk > tankerForecast.teamFuelRisk + max(60, G.fuelLimit / 2);
         int safetyMargin = max(2, allForecast.serverEst / 20);
         bool tankerHasValue =
-            tankerForecast.runtimeRequests > 0 &&
-            tankerForecast.successfulRefuels > 0;
+            (tankerForecast.runtimeRequests > 0 &&
+             tankerForecast.successfulRefuels > 0) ||
+            (tankerForecast.hubCounterfactual &&
+             tankerForecast.hubSharedSteps >= 2 &&
+             tankerForecast.hubSavedFuel >= max(G.fuelLimit, 40));
         bool tankerFarmGain =
             tankerHasValue &&
             tankerForecast.savedPortions >= 2 &&
@@ -5907,25 +6225,29 @@ static void handleSetup(const mj::Value& m) {
             tankerForecast.serverEst + safetyMargin >= allForecast.serverEst &&
             tankerForecast.savedPortions >= 0;
         bool tankerHubCounterfactual =
-            !tankerHasValue &&
-            tankerForecast.savedPortions >= 2 &&
-            tankerForecast.serverEst + 1 >= allForecast.serverEst &&
+            tankerForecast.hubCounterfactual &&
+            tankerForecast.hubSharedSteps >= 2 &&
+            tankerForecast.serverEst + max(4, safetyMargin) >= allForecast.serverEst &&
             tankerForecast.tankerIdleDays <= 1 &&
             (
                 allForecast.lowFuelPatrols >= tankerForecast.lowFuelPatrols + max(2, nAgents / 3) ||
                 allForecast.minFuelEnd + max(12, G.fuelLimit / 5) <= tankerForecast.minFuelEnd ||
-                allForecast.teamFuelRisk > tankerForecast.teamFuelRisk + max(40, G.fuelLimit / 3)
+                allForecast.teamFuelRisk > tankerForecast.teamFuelRisk + max(40, G.fuelLimit / 3) ||
+                tankerForecast.hubSavedFuel >= max(G.fuelLimit * 2, 80)
             );
         tankerForecast.verifiedFuelHorizon = fuelHorizonVerified;
         bool tankerIdleBad = tankerForecast.tankerIdleDays >= 2 && !tankerPreventsCollapse && !tankerFarmGain;
         if (fuelHorizonVerified || tankerFarmGain || tankerHubCounterfactual) {
             refuelCount = 1;
             selectedAssignmentReason = fuelHorizonVerified ? "fuel_horizon_verified" : (tankerHubCounterfactual ? "tanker_hub_counterfactual" : "tanker_server_gain");
+            if (tankerForecast.hubBestPos >= 0) G.preferredTankerHub = tankerForecast.hubBestPos;
         } else if (!tankerHasValue || tankerForecast.savedPortions <= 0 || allForecast.serverEst >= tankerForecast.serverEst + 2 || tankerIdleBad) {
             refuelCount = 0;
+            G.preferredTankerHub = -1;
             selectedAssignmentReason = !tankerHasValue ? "no_feasible_refuel" : (tankerForecast.savedPortions <= 0 ? "no_tanker_negative_value" : (tankerIdleBad ? "tanker_idle_forecast" : "all_patrol_server_gain"));
         } else {
             selectedAssignmentReason = "assignment_tie_keep_default";
+            if (refuelCount > 0 && tankerForecast.hubBestPos >= 0) G.preferredTankerHub = tankerForecast.hubBestPos;
         }
         int tankerValueEst = tankerForecast.serverEst - allForecast.serverEst - tankerForecast.idlePenalty;
         cerr << "setup_ab_3day"
@@ -5945,11 +6267,17 @@ static void handleSetup(const mj::Value& m) {
              << " tanker_feasible_refuels=" << tankerForecast.feasibleRefuels
              << " tanker_successful_refuels=" << tankerForecast.successfulRefuels
              << " tanker_runtime_requests=" << tankerForecast.runtimeRequests
+             << " tanker_hub_candidates=" << tankerForecast.hubCandidateCount
+             << " tanker_hub_pos=" << tankerForecast.hubBestPos
+             << " tanker_hub_shared_steps=" << tankerForecast.hubSharedSteps
+             << " tanker_hub_saved_fuel=" << tankerForecast.hubSavedFuel
+             << " tanker_hub_bonus=" << tankerForecast.hubServerBonus
              << " tanker_saved_portions=" << tankerForecast.savedPortions
              << " tanker_idle_penalty=" << tankerForecast.idlePenalty
              << " tanker_verified_fuel_horizon=" << (tankerForecast.verifiedFuelHorizon ? 1 : 0)
              << " tanker_safety_margin=" << safetyMargin
              << " tanker_value_est=" << tankerValueEst
+             << " setup_hub_forecast_ms=" << setupForecastMs
              << " selected_refuels=" << refuelCount
              << " selected_assignment_reason=" << selectedAssignmentReason
              << "\n";
@@ -5967,6 +6295,7 @@ static void handleSetup(const mj::Value& m) {
          << " all_patrol_counterfactual=" << (nAgents > 0 ? nAgents : 0)
          << " tanker_refuel_gain=0"
          << " tanker_idle_steps=0"
+         << " preferred_tanker_hub=" << G.preferredTankerHub
          << " selected_assignment_reason=" << selectedAssignmentReason
          << "\n";
     DAY_PATH_CACHE.clear();
