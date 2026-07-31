@@ -258,6 +258,21 @@ enum class PlanProfile {
     GeneralLarge
 };
 
+enum class MapFamily {
+    S8,
+    S12,
+    M16,
+    L24,
+    XL32
+};
+
+enum class TimeProfile {
+    Fast,
+    Normal,
+    Deep,
+    Long
+};
+
 enum class FuelPolicy {
     GreedyToday,
     BalancedFuel,
@@ -356,6 +371,8 @@ struct PlannerConfig {
     int stockCap = 0;
     int patrols = 0;
     int refuels = 0;
+    MapFamily mapFamily = MapFamily::S12;
+    TimeProfile timeProfile = TimeProfile::Normal;
     int deadlineMode = 0;
     int daySeconds = 0;
     bool ultraFastMode = false;
@@ -374,6 +391,10 @@ struct PlannerConfig {
     int minEndFuelReserve = 0;
     int futureFuelLambda = 1;
     int clusterQuotaStrictness = 1;
+    int clusterCount = 1;
+    int setPackingTopK = 64;
+    int routeScope = 0;
+    int terminalWeight = 1;
 };
 
 static PlannerConfig CURRENT_CONFIG;
@@ -419,6 +440,50 @@ static int medianDaySteps() {
     return steps[steps.size() / 2];
 }
 
+static MapFamily selectMapFamily() {
+    int maxDim = max(G.width, G.height);
+    if (maxDim <= 8) return MapFamily::S8;
+    if (maxDim <= 12) return MapFamily::S12;
+    if (maxDim <= 16) return MapFamily::M16;
+    if (maxDim <= 24) return MapFamily::L24;
+    return MapFamily::XL32;
+}
+
+static const char* mapFamilyName(MapFamily family) {
+    switch (family) {
+        case MapFamily::S8: return "S8";
+        case MapFamily::S12: return "S12";
+        case MapFamily::M16: return "M16";
+        case MapFamily::L24: return "L24";
+        case MapFamily::XL32: return "XL32";
+    }
+    return "S12";
+}
+
+static TimeProfile selectTimeProfile() {
+    if (G.deadlineMarginMs < 0 || G.ultraFastMode || G.deadlineMode >= 2) return TimeProfile::Fast;
+    int available = G.hardBudgetMs > 0 ? G.hardBudgetMs : G.deadlineMarginMs;
+    if (available >= 30000) return TimeProfile::Long;
+    if (available >= 1000000) {
+        if (G.daySeconds >= 30) return TimeProfile::Long;
+        if (G.daySeconds >= 5) return TimeProfile::Deep;
+        return TimeProfile::Normal;
+    }
+    if (available < 500) return TimeProfile::Fast;
+    if (available <= 8000) return TimeProfile::Normal;
+    return TimeProfile::Deep;
+}
+
+static const char* timeProfileName(TimeProfile profile) {
+    switch (profile) {
+        case TimeProfile::Fast: return "fast";
+        case TimeProfile::Normal: return "normal";
+        case TimeProfile::Deep: return "deep";
+        case TimeProfile::Long: return "long";
+    }
+    return "normal";
+}
+
 static PlannerConfig makePlannerConfig(const vector<Agent>& agents) {
     PlannerConfig cfg;
     cfg.dayBudget = G.dayBudget();
@@ -439,14 +504,20 @@ static PlannerConfig makePlannerConfig(const vector<Agent>& agents) {
         }
     }
     cfg.fuelRatio = fuelCount ? (double)fuelSum / (double)max(1, fuelCount * G.fuelLimit) : 1.0;
+    cfg.mapFamily = selectMapFamily();
+    cfg.timeProfile = selectTimeProfile();
     cfg.deadlineMode = G.deadlineMode;
     cfg.daySeconds = G.daySeconds;
     cfg.ultraFastMode = G.ultraFastMode || cfg.deadlineMode >= 2 ||
         (cfg.daySeconds > 0 && cfg.daySeconds <= 1) || G.deadlineMarginMs < 250;
 
     double stockPerPatrol = (double)cfg.stockCap / (double)max(1, cfg.patrols);
-    bool large = cfg.mapScale >= 24.0;
-    bool maxLarge = cfg.mapScale >= 32.0;
+    bool small8 = cfg.mapFamily == MapFamily::S8;
+    bool small12 = cfg.mapFamily == MapFamily::S12;
+    bool medium16 = cfg.mapFamily == MapFamily::M16;
+    bool large24 = cfg.mapFamily == MapFamily::L24;
+    bool maxLarge = cfg.mapFamily == MapFamily::XL32;
+    bool large = large24 || maxLarge;
     bool finalDay = cfg.daysLeft <= 1;
     int fuelTight = cfg.fuelRatio < 0.35 ? 1 : 0;
 
@@ -461,6 +532,66 @@ static PlannerConfig makePlannerConfig(const vector<Agent>& agents) {
     cfg.computeBudgetMs = large ? 420 : 190;
     cfg.computeBudgetMs += min(160, cfg.stockCap * 3);
     cfg.computeBudgetMs = min(650, max(120, cfg.computeBudgetMs));
+
+    cfg.clusterCount = 1;
+    cfg.routeScope = 0;
+    cfg.setPackingTopK = 64;
+    cfg.terminalWeight = 1;
+    if (small8) {
+        cfg.beamWidth = max(cfg.beamWidth, 52);
+        cfg.poolLimit = max(cfg.poolLimit, 12);
+        cfg.routeModeCount = max(cfg.routeModeCount, 12);
+        cfg.heavyTargetLimit = max(cfg.heavyTargetLimit, min((int)G.spots.size(), cfg.patrols + 4));
+        cfg.maxVisits = max(cfg.maxVisits, min(12, max(5, cfg.dayBudget / 5)));
+        cfg.clusterCount = 1;
+        cfg.setPackingTopK = 256;
+        cfg.computeBudgetMs = max(cfg.computeBudgetMs, 260);
+    } else if (small12) {
+        cfg.beamWidth = max(cfg.beamWidth, 58);
+        cfg.poolLimit = max(cfg.poolLimit, 11);
+        cfg.routeModeCount = max(cfg.routeModeCount, 12);
+        cfg.heavyTargetLimit = max(cfg.heavyTargetLimit, min((int)G.spots.size(), cfg.patrols + 3));
+        cfg.maxVisits = max(cfg.maxVisits, min(11, max(6, cfg.dayBudget / 7)));
+        cfg.clusterCount = max(1, min((int)G.spots.size(), max(2, cfg.patrols / 2)));
+        cfg.setPackingTopK = 128;
+    } else if (medium16) {
+        cfg.beamWidth = max(cfg.beamWidth, 62);
+        cfg.poolLimit = max(cfg.poolLimit, 12);
+        cfg.routeModeCount = max(cfg.routeModeCount, 12);
+        cfg.heavyTargetLimit = max(cfg.heavyTargetLimit, min((int)G.spots.size(), cfg.patrols + 3));
+        cfg.maxVisits = max(cfg.maxVisits, min(10, max(5, cfg.dayBudget / 8)));
+        cfg.clusterCount = max(2, min((int)G.spots.size(), max(2, cfg.patrols / 2)));
+        cfg.setPackingTopK = 128;
+        cfg.terminalWeight = 2;
+    } else if (large24) {
+        cfg.clusterCount = max(3, min(5, min((int)G.spots.size(), max(3, cfg.patrols / 2))));
+        cfg.routeScope = 1;
+        cfg.beamWidth = max(cfg.beamWidth, 72);
+        cfg.poolLimit = max(cfg.poolLimit, max(12, cfg.clusterCount * 2 + 4));
+        cfg.routeModeCount = max(cfg.routeModeCount, 12);
+        cfg.heavyTargetLimit = max(cfg.heavyTargetLimit, min((int)G.spots.size(), cfg.clusterCount + 4));
+        cfg.maxVisits = min(max(cfg.maxVisits, 7), 11);
+        cfg.setPackingTopK = 128;
+        cfg.terminalWeight = 3;
+    } else {
+        cfg.clusterCount = max(4, min(6, min((int)G.spots.size(), max(4, cfg.patrols / 2 + 1))));
+        cfg.routeScope = 1;
+        cfg.beamWidth = max(cfg.beamWidth, 76);
+        cfg.poolLimit = max(cfg.poolLimit, max(12, cfg.clusterCount * 2 + 4));
+        cfg.routeModeCount = max(cfg.routeModeCount, 12);
+        cfg.heavyTargetLimit = max(cfg.heavyTargetLimit, min((int)G.spots.size(), cfg.clusterCount + 4));
+        cfg.maxVisits = min(max(cfg.maxVisits, 6), 9);
+        cfg.setPackingTopK = 128;
+        cfg.terminalWeight = 4;
+    }
+
+    if (cfg.timeProfile == TimeProfile::Fast) {
+        cfg.setPackingTopK = small8 ? 96 : (large ? 48 : 64);
+    } else if (cfg.timeProfile == TimeProfile::Normal) {
+        cfg.setPackingTopK = small8 ? 256 : (large ? 160 : 128);
+    } else {
+        cfg.setPackingTopK = small8 ? 512 : (large ? 512 : 384);
+    }
 
     if (cfg.dayBudget < cfg.medianDaySteps) {
         cfg.beamWidth = max(24, (int)(cfg.beamWidth * cfg.stepRatio));
@@ -532,17 +663,21 @@ static PlannerConfig makePlannerConfig(const vector<Agent>& agents) {
 
     bool deepTimeAvailable =
         !cfg.ultraFastMode &&
-        ((cfg.daySeconds >= 5 && G.deadlineMarginMs > 1800) ||
+        (cfg.timeProfile == TimeProfile::Deep ||
+         cfg.timeProfile == TimeProfile::Long ||
+         (cfg.daySeconds >= 5 && G.deadlineMarginMs > 1800) ||
          (cfg.daySeconds == 0 && G.deadlineMarginMs >= 1000000) ||
          G.hardBudgetMs >= 1000);
     if (deepTimeAvailable) {
         int extraBudget = G.hardBudgetMs > 0 ? G.hardBudgetMs : max(0, G.deadlineMarginMs - 450);
-        int deepCap = large ? 1800 : 1200;
+        int deepCap = cfg.timeProfile == TimeProfile::Long ? (large ? 4500 : 3000) : (large ? 1800 : 1200);
         cfg.computeBudgetMs = max(cfg.computeBudgetMs, min(deepCap, max(350, extraBudget)));
-        cfg.beamWidth += large ? 24 : 16;
-        cfg.poolLimit += large ? 4 : 3;
-        cfg.routeModeCount += large ? 3 : 2;
-        cfg.heavyTargetLimit = max(cfg.heavyTargetLimit, min((int)G.spots.size(), cfg.patrols + (large ? 5 : 3)));
+        if (cfg.timeProfile == TimeProfile::Long) {
+            cfg.beamWidth += large ? 24 : 16;
+            cfg.poolLimit += large ? 4 : 3;
+            cfg.routeModeCount += large ? 3 : 2;
+            cfg.heavyTargetLimit = max(cfg.heavyTargetLimit, min((int)G.spots.size(), cfg.patrols + (large ? 5 : 3)));
+        }
     }
 
     cfg.beamWidth = min(cfg.beamWidth, large ? (deepTimeAvailable ? 140 : 100) : (deepTimeAvailable ? 110 : 85));
@@ -561,7 +696,8 @@ static PlannerConfig makePlannerConfig(const vector<Agent>& agents) {
     }
     if (G.hardBudgetMs > 0) {
         int hardBudget = max(10, G.hardBudgetMs);
-        int stableBenchmarkBudget = large ? 1600 : 1100;
+        int stableBenchmarkBudget = cfg.timeProfile == TimeProfile::Long ? (large ? 4500 : 3000) :
+            (large ? 1600 : 1000);
         cfg.computeBudgetMs = min(hardBudget, stableBenchmarkBudget);
     }
     int daysAfterToday = max(0, (int)G.daySteps.size() - G.day - 1);
@@ -569,6 +705,23 @@ static PlannerConfig makePlannerConfig(const vector<Agent>& agents) {
     cfg.maxFuelUsePerRoute = INF;
     cfg.futureFuelLambda = ((int)G.daySteps.size() >= 6 && daysAfterToday >= 2) ? 2 : 1;
     cfg.clusterQuotaStrictness = large ? 2 : 1;
+    if (medium16) {
+        cfg.futureFuelLambda = max(cfg.futureFuelLambda, 2);
+        cfg.clusterQuotaStrictness = max(cfg.clusterQuotaStrictness, 2);
+    } else if (large24) {
+        cfg.futureFuelLambda = max(cfg.futureFuelLambda, 3);
+        cfg.clusterQuotaStrictness = max(cfg.clusterQuotaStrictness, 3);
+    } else if (maxLarge) {
+        cfg.futureFuelLambda = max(cfg.futureFuelLambda, 4);
+        cfg.clusterQuotaStrictness = max(cfg.clusterQuotaStrictness, 4);
+    }
+    if (cfg.timeProfile == TimeProfile::Fast) {
+        cfg.setPackingTopK = min(cfg.setPackingTopK, large ? 64 : (small8 ? 96 : 64));
+    } else if (cfg.timeProfile == TimeProfile::Normal) {
+        cfg.setPackingTopK = max(cfg.setPackingTopK, large ? 160 : (small8 ? 256 : 128));
+    } else {
+        cfg.setPackingTopK = max(cfg.setPackingTopK, large ? 512 : (small8 ? 512 : 384));
+    }
     cfg.deadlineReserveMs = cfg.computeBudgetMs <= 60 ? 3 : 8;
     return cfg;
 }
@@ -615,9 +768,9 @@ static bool isLargeMap() {
 }
 
 static PlanProfile selectPlanProfile() {
-    int maxDim = max(G.width, G.height);
-    if (maxDim <= 12 || (int)G.spots.size() <= 8) return PlanProfile::LegacySmallMap;
-    if (maxDim <= 16) return PlanProfile::Hybrid16;
+    MapFamily family = selectMapFamily();
+    if (family == MapFamily::S8 || family == MapFamily::S12) return PlanProfile::LegacySmallMap;
+    if (family == MapFamily::M16) return PlanProfile::Hybrid16;
     return PlanProfile::GeneralLarge;
 }
 
@@ -638,7 +791,6 @@ static int plannerElapsedMs() {
 
 static bool plannerTimeExceeded(int reserveMs = 0) {
     PLANNER_STATS.deadlineChecks++;
-    if (G.hardBudgetMs > 0 && G.deadlineMarginMs >= 1000000) return false;
     if (DEADLINE_ACTIVE) return ACTIVE_DEADLINE.expired(reserveMs);
     int budget = plannerBudgetMs();
     return budget > 0 && plannerElapsedMs() + reserveMs >= budget;
@@ -652,16 +804,25 @@ static int adaptiveBeamWidth(int dayBudget) {
 static int adaptivePoolLimit(int dayBudget) {
     (void)dayBudget;
     int limit = CURRENT_CONFIG.poolLimit;
+    if (CURRENT_CONFIG.mapFamily == MapFamily::S8) return min(max(limit, 16), 24);
     if (isLargeMap() && G.deadlineMarginMs >= 100) {
-        int clusterGuess = max(2, min((int)G.spots.size(), max(2, CURRENT_CONFIG.patrols / 2)));
+        int clusterGuess = CURRENT_CONFIG.clusterCount > 0
+            ? CURRENT_CONFIG.clusterCount
+            : max(2, min((int)G.spots.size(), max(2, CURRENT_CONFIG.patrols / 2)));
         limit = max(limit, max(10, clusterGuess * 2 + 4));
     }
-    return min(limit, isLargeMap() ? 18 : 14);
+    if (CURRENT_CONFIG.mapFamily == MapFamily::M16) limit = max(limit, 12);
+    return min(limit, isLargeMap() ? 20 : 16);
 }
 
 static int adaptiveHeavyTargetLimit(int dayBudget) {
     (void)dayBudget;
-    return CURRENT_CONFIG.heavyTargetLimit;
+    int limit = CURRENT_CONFIG.heavyTargetLimit;
+    if (CURRENT_CONFIG.mapFamily == MapFamily::S8) limit = max(limit, min((int)G.spots.size(), CURRENT_CONFIG.patrols + 4));
+    if (CURRENT_CONFIG.mapFamily == MapFamily::L24 || CURRENT_CONFIG.mapFamily == MapFamily::XL32) {
+        limit = max(limit, min((int)G.spots.size(), CURRENT_CONFIG.clusterCount + 4));
+    }
+    return limit;
 }
 
 static int adaptiveRouteModeCount(int dayBudget) {
@@ -1157,10 +1318,18 @@ static vector<Cluster> buildSpatialClusters(const vector<Agent>& agents, int k) 
 static vector<Cluster> buildClusters(const vector<Agent>& agents) {
     int patrols = 0;
     for (const Agent& agent : agents) if (agent.kind == 0) patrols++;
-    bool largeMap = max(G.width, G.height) >= 24 || G.nodeCount() >= 24 * 24;
+    bool largeMap = isLargeMap();
     bool mediumDense = false;
     if (largeMap && G.spots.size() >= 6) {
-        int k = min((int)G.spots.size(), max(2, patrols / 2));
+        int k = CURRENT_CONFIG.clusterCount > 0
+            ? CURRENT_CONFIG.clusterCount
+            : min((int)G.spots.size(), max(2, patrols / 2));
+        return buildSpatialClusters(agents, k);
+    }
+    if (CURRENT_CONFIG.mapFamily == MapFamily::M16 && G.spots.size() >= 6) {
+        int k = CURRENT_CONFIG.clusterCount > 0
+            ? CURRENT_CONFIG.clusterCount
+            : min((int)G.spots.size(), max(2, patrols / 2));
         return buildSpatialClusters(agents, k);
     }
     if (mediumDense) {
@@ -1191,7 +1360,9 @@ static int estimateTerminalValue(const Route& route, const vector<Cluster>& clus
     for (const Cluster& cluster : clusters) {
         int d = paths.dist[cluster.center];
         if (d >= INF) continue;
-        int value = 100 * cluster.totalStock + 30 * __builtin_popcount((unsigned)cluster.brandMask) - 5 * d;
+        int value = (100 + 20 * CURRENT_CONFIG.terminalWeight) * cluster.totalStock +
+            (30 + 8 * CURRENT_CONFIG.terminalWeight) * __builtin_popcount((unsigned)cluster.brandMask) -
+            (5 + CURRENT_CONFIG.terminalWeight) * d;
         best = max(best, value);
     }
     return best + min(route.fuelLeft, G.fuelLimit);
@@ -3331,8 +3502,22 @@ static vector<Route> combineRoutesStockAware(const vector<Agent>& agents, const 
         BeamState dfsFeasibleBest = best;
         PlanEval dfsFeasibleEval;
         bool dfsFoundFeasible = false;
+        vector<BeamState> topLeaves;
         BeamState current = initial;
         int choiceLimit = isLargeMap() ? 5 : 6;
+        int exactRescoreLimit = max(16, CURRENT_CONFIG.setPackingTopK);
+        if (G.deadlineMarginMs >= 0 && G.deadlineMarginMs < 1200) exactRescoreLimit = min(exactRescoreLimit, 64);
+        if (CURRENT_CONFIG.mapFamily == MapFamily::S8 && CURRENT_CONFIG.timeProfile != TimeProfile::Fast) {
+            exactRescoreLimit = max(exactRescoreLimit, 256);
+        }
+        auto keepTopLeaf = [&](const BeamState& leaf) {
+            topLeaves.push_back(leaf);
+            sort(topLeaves.begin(), topLeaves.end(), [&](const BeamState& a, const BeamState& b) {
+                return betterTeamState(a, b);
+            });
+            int keep = min((int)topLeaves.size(), exactRescoreLimit * 3);
+            if ((int)topLeaves.size() > keep) topLeaves.resize(keep);
+        };
         function<void(int)> dfs = [&](int idx) {
             if (setPackingStates >= 12000 || plannerTimeExceeded(4)) {
                 setPackingInterrupted = true;
@@ -3342,21 +3527,7 @@ static vector<Route> combineRoutesStockAware(const vector<Agent>& agents, const 
                 current.rank = recomputeRank(current.eval);
                 setPackingFeasibleStates++;
                 if (betterTeamState(current, dfsBest)) dfsBest = current;
-                bool exactLeafScan = false;
-                if (exactLeafScan && !plannerTimeExceeded(1)) {
-                    PlanEval simulated = evalTeamState(current);
-                    if (simulated.negativeSlackFinal == 0) {
-                        bool betterFeasible = !dfsFoundFeasible ||
-                            simulated.dailyBrands > dfsFeasibleEval.dailyBrands ||
-                            (simulated.dailyBrands == dfsFeasibleEval.dailyBrands && simulated.serverEst > dfsFeasibleEval.serverEst) ||
-                            (simulated.dailyBrands == dfsFeasibleEval.dailyBrands && simulated.serverEst == dfsFeasibleEval.serverEst && simulated.cappedPortions > dfsFeasibleEval.cappedPortions);
-                        if (betterFeasible) {
-                            dfsFeasibleBest = current;
-                            dfsFeasibleEval = simulated;
-                            dfsFoundFeasible = true;
-                        }
-                    }
-                }
+                keepTopLeaf(current);
                 return;
             }
             int agentId = patrolIds[idx];
@@ -3401,6 +3572,31 @@ static vector<Route> combineRoutesStockAware(const vector<Agent>& agents, const 
             }
         };
         dfs(0);
+        int exactRescored = 0;
+        for (const BeamState& leaf : topLeaves) {
+            if (exactRescored >= exactRescoreLimit || plannerTimeExceeded(3)) break;
+            PlanEval simulated = evalTeamState(leaf);
+            exactRescored++;
+            if (simulated.negativeSlackFinal != 0) continue;
+            bool betterFeasible = !dfsFoundFeasible ||
+                simulated.dailyBrands > dfsFeasibleEval.dailyBrands ||
+                (simulated.dailyBrands == dfsFeasibleEval.dailyBrands && simulated.serverEst > dfsFeasibleEval.serverEst) ||
+                (simulated.dailyBrands == dfsFeasibleEval.dailyBrands && simulated.serverEst == dfsFeasibleEval.serverEst && simulated.cappedPortions > dfsFeasibleEval.cappedPortions) ||
+                (simulated.dailyBrands == dfsFeasibleEval.dailyBrands && simulated.serverEst == dfsFeasibleEval.serverEst && simulated.cappedPortions == dfsFeasibleEval.cappedPortions && simulated.ghostVisits < dfsFeasibleEval.ghostVisits);
+            if (betterFeasible) {
+                dfsFeasibleBest = leaf;
+                dfsFeasibleEval = simulated;
+                dfsFoundFeasible = true;
+            }
+        }
+        if (!SUPPRESS_PLAN_LOGS) {
+            cerr << "set_packing_topk day=" << G.day
+                 << " leaves=" << topLeaves.size()
+                 << " exact_rescore_limit=" << exactRescoreLimit
+                 << " exact_rescored=" << exactRescored
+                 << " feasible_exact_found=" << (dfsFoundFeasible ? 1 : 0)
+                 << "\n";
+        }
         teamStateCandidates.push_back(dfsBest);
         if (betterTeamState(dfsBest, best)) {
             best = std::move(dfsBest);
@@ -4619,6 +4815,8 @@ static vector<vector<int>> finalizePlanForOutput(
          << " median_steps=" << CURRENT_CONFIG.medianDaySteps
          << " step_ratio=" << CURRENT_CONFIG.stepRatio
          << " map_scale=" << CURRENT_CONFIG.mapScale
+         << " map_family=" << mapFamilyName(CURRENT_CONFIG.mapFamily)
+         << " time_profile=" << timeProfileName(CURRENT_CONFIG.timeProfile)
          << " fuel_ratio=" << CURRENT_CONFIG.fuelRatio
          << " stock_cap=" << CURRENT_CONFIG.stockCap
          << " patrols=" << CURRENT_CONFIG.patrols
@@ -4627,6 +4825,9 @@ static vector<vector<int>> finalizePlanForOutput(
          << " pool=" << CURRENT_CONFIG.poolLimit
          << " modes=" << CURRENT_CONFIG.routeModeCount
          << " heavy=" << CURRENT_CONFIG.heavyTargetLimit
+         << " cluster_count=" << CURRENT_CONFIG.clusterCount
+         << " set_packing_topk=" << CURRENT_CONFIG.setPackingTopK
+         << " route_scope=" << CURRENT_CONFIG.routeScope
          << " min_slack=" << CURRENT_CONFIG.minSlack
          << " max_visits=" << CURRENT_CONFIG.maxVisits
          << " traffic_reserve=" << CURRENT_CONFIG.trafficRiskReserveSteps
@@ -5136,6 +5337,8 @@ static vector<vector<int>> planDay(const vector<Agent>& agents) {
          << " median_steps=" << CURRENT_CONFIG.medianDaySteps
          << " step_ratio=" << CURRENT_CONFIG.stepRatio
          << " map_scale=" << CURRENT_CONFIG.mapScale
+         << " map_family=" << mapFamilyName(CURRENT_CONFIG.mapFamily)
+         << " time_profile=" << timeProfileName(CURRENT_CONFIG.timeProfile)
          << " fuel_ratio=" << CURRENT_CONFIG.fuelRatio
          << " stock_cap=" << CURRENT_CONFIG.stockCap
          << " patrols=" << CURRENT_CONFIG.patrols
@@ -5144,6 +5347,9 @@ static vector<vector<int>> planDay(const vector<Agent>& agents) {
          << " pool=" << CURRENT_CONFIG.poolLimit
          << " modes=" << CURRENT_CONFIG.routeModeCount
          << " heavy=" << CURRENT_CONFIG.heavyTargetLimit
+         << " cluster_count=" << CURRENT_CONFIG.clusterCount
+         << " set_packing_topk=" << CURRENT_CONFIG.setPackingTopK
+         << " route_scope=" << CURRENT_CONFIG.routeScope
          << " min_slack=" << CURRENT_CONFIG.minSlack
          << " max_visits=" << CURRENT_CONFIG.maxVisits
          << " deadline_mode=" << CURRENT_CONFIG.deadlineMode
@@ -5336,6 +5542,34 @@ static vector<vector<int>> planDay(const vector<Agent>& agents) {
     }
     if (!plannerTimeExceeded(20)) {
         selectedPlan = repairRiskySlackRoutes(selectedPlan, agents, dayBudget);
+    }
+    if (CURRENT_CONFIG.mapFamily == MapFamily::S8) {
+        string capPlanName = selectedPlanName;
+        string capReason = selectedReason;
+        vector<vector<int>> safeFallback = buildSafePlan(agents, dayBudget);
+        vector<vector<int>> capReady = finalizePlanForOutput(selectedPlan, safeFallback, agents, dayBudget, capPlanName, capReason);
+        ExactScore capExact = exactScoreForPlan(capReady, agents, dayBudget);
+        if (capExact.valid && capExact.actualPortions >= stockCap() && capExact.serverEst >= stockCap()) {
+            selectedPlan = std::move(capReady);
+            selectedPlanName = capPlanName;
+            selectedReason = "s8_cap_reached";
+            logPlanSummary("final_plan_summary", selectedPlan, agents, dayBudget, selectedPlanName, selectedReason);
+            int computeMs = (int)chrono::duration_cast<chrono::milliseconds>(
+                chrono::steady_clock::now() - started).count();
+            int strongMs = (int)chrono::duration_cast<chrono::milliseconds>(
+                chrono::steady_clock::now() - strongStarted).count();
+            cerr << "planner_timing day=" << G.day
+                 << " compute_ms=" << computeMs
+                 << " budget_ms=" << plannerBudgetMs()
+                 << " fast_ms=" << fastMs
+                 << " strong_ms=" << strongMs
+                 << " early_cap=1\n";
+            updateSpotMissDebtFromPlan(selectedPlan, agents, dayBudget);
+            return selectedPlan;
+        }
+        selectedPlan = std::move(capReady);
+        selectedPlanName = capPlanName;
+        selectedReason = capReason;
     }
     vector<vector<int>> safeFallback = buildSafePlan(agents, dayBudget);
     vector<RolloutPlanCandidate> rolloutCandidates;
@@ -5608,6 +5842,8 @@ static void handleSetup(const mj::Value& m) {
     bool tinyShortMatch = maxDim <= 8 && nAgents <= 4 && (int)G.daySteps.size() <= 4 &&
         totalStepBudget <= G.fuelLimit * 2;
     if (tinyShortMatch) refuelCount = 0;
+    bool s8AllPatrolDefault = selectMapFamily() == MapFamily::S8 && nAgents <= 4;
+    if (s8AllPatrolDefault) refuelCount = 0;
 
     vector<pair<long long,int>> refuelRank;
     DAY_PATH_CACHE.clear();
@@ -5643,8 +5879,8 @@ static void handleSetup(const mj::Value& m) {
         refuelRank.push_back({rank, i});
     }
     sort(refuelRank.begin(), refuelRank.end());
-    string selectedAssignmentReason = "default";
-    if (nAgents >= 6 && (int)G.daySteps.size() >= 4 && refuelCount <= 1 && !refuelRank.empty()) {
+    string selectedAssignmentReason = s8AllPatrolDefault ? "s8_all_patrol" : "default";
+    if (!s8AllPatrolDefault && nAgents >= 6 && (int)G.daySteps.size() >= 4 && refuelCount <= 1 && !refuelRank.empty()) {
         SetupForecast allForecast = forecastSetupAssignment(startPositions, refuelRank, 0);
         SetupForecast tankerForecast = forecastSetupAssignment(startPositions, refuelRank, 1);
         tankerForecast.savedPortions = tankerForecast.serverEst - allForecast.serverEst;

@@ -14,6 +14,25 @@ def load_json(path):
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
+def accepted_response(payload):
+    if payload is None or not isinstance(payload, dict):
+        return False
+    for key in ("valid", "accepted", "ok", "success"):
+        if key in payload:
+            return bool(payload.get(key))
+    status = str(payload.get("status", "")).lower()
+    if status in ("ok", "accepted", "success", "valid"):
+        return True
+    if status in ("error", "invalid", "rejected", "failed", "failure"):
+        return False
+    if "error" in payload:
+        return False
+    if "reason" in payload and str(payload.get("reason", "")).strip():
+        return False
+    response_type = str(payload.get("type", "")).lower()
+    return "result" in response_type or "accepted" in response_type or "action" in response_type or "assignment" in response_type
+
+
 def main():
     parser = argparse.ArgumentParser(description="Analyze saved HEXUDON match replay/actions.")
     parser.add_argument("match_id")
@@ -107,6 +126,29 @@ def main():
     }
     expected_days = set(range(len(day_steps)))
     missing_action_days = sorted(expected_days - action_days)
+    action_response_days = {
+        int(match.group(1))
+        for path in base.glob("day-*-action-response.json")
+        for match in [re.search(r"day-(\d+)-action-response", path.name)]
+        if match
+    }
+    assignment_response_path = base / "assignment-response.json"
+    response_artifacts_expected = bool(action_response_days) or assignment_response_path.exists()
+    missing_action_response_days = sorted(expected_days - action_response_days) if response_artifacts_expected else []
+    invalid_action_response_days = []
+    for day in sorted(action_response_days):
+        response_path = base / f"day-{day}-action-response.json"
+        try:
+            if not accepted_response(load_json(response_path)):
+                invalid_action_response_days.append(day)
+        except Exception:
+            invalid_action_response_days.append(day)
+    assignment_response_valid = None
+    if assignment_response_path.exists():
+        try:
+            assignment_response_valid = accepted_response(load_json(assignment_response_path))
+        except Exception:
+            assignment_response_valid = False
     stderr_quality = {
         day: {
             "negative_slack_routes": 0,
@@ -132,6 +174,25 @@ def main():
             setup_match = re.search(r"setup width=.* selected_assignment_reason=([a-z_]+)", line)
             if setup_match and not setup_assignment_reason:
                 setup_assignment_reason = setup_match.group(1)
+            planner_config_match = re.search(r"planner_config day=(\d+) (.*)", line)
+            if planner_config_match:
+                day = int(planner_config_match.group(1))
+                if day in stderr_quality:
+                    tail = planner_config_match.group(2)
+                    pairs = dict((key, int(value)) for key, value in re.findall(r"([a-z_]+)=(-?\d+)", tail))
+                    float_pairs = dict((key, value) for key, value in re.findall(r"([a-z_]+)=(-?\d+\.\d+)", tail))
+                    text_pairs = dict((key, value) for key, value in re.findall(r"([a-z_]+)=([A-Za-z0-9_]+)", tail))
+                    for key in (
+                        "cluster_count", "set_packing_topk", "route_scope", "beam", "pool",
+                        "modes", "heavy", "max_visits", "deadline_mode", "ultra_fast",
+                    ):
+                        if key in pairs:
+                            stderr_quality[day][key] = pairs[key]
+                    for key in ("map_family", "time_profile"):
+                        if key in text_pairs:
+                            stderr_quality[day][key] = text_pairs[key]
+                    if "map_scale" in float_pairs:
+                        stderr_quality[day]["map_scale"] = float(float_pairs["map_scale"])
             brand_constraint_match = re.search(r"brand_constraint day=(\d+) .*max_reachable=(\d+)", line)
             if brand_constraint_match:
                 day = int(brand_constraint_match.group(1))
@@ -163,6 +224,14 @@ def main():
                         0,
                         int(preservation_match.group(2)) - int(preservation_match.group(3)),
                     )
+            topk_match = re.search(r"set_packing_topk day=(\d+) .*leaves=(\d+).*exact_rescore_limit=(\d+).*exact_rescored=(\d+).*feasible_exact_found=(\d+)", line)
+            if topk_match:
+                day = int(topk_match.group(1))
+                if day in stderr_quality:
+                    stderr_quality[day]["set_packing_topk_leaves"] = int(topk_match.group(2))
+                    stderr_quality[day]["set_packing_exact_rescore_limit"] = int(topk_match.group(3))
+                    stderr_quality[day]["set_packing_exact_rescored"] = int(topk_match.group(4))
+                    stderr_quality[day]["set_packing_feasible_exact_found"] = int(topk_match.group(5))
             rendezvous_match = re.search(r"rendezvous_candidate day=(\d+).*shared_step=(-?\d+).*portions_saved=(-?\d+)", line)
             if rendezvous_match:
                 day = int(rendezvous_match.group(1))
@@ -629,6 +698,11 @@ def main():
             "oversweep_routes": quality.get("oversweep_routes", 0),
             "selected_profile": quality.get("selected_profile"),
             "selected_reason": quality.get("selected_reason"),
+            "map_family": quality.get("map_family", ""),
+            "time_profile": quality.get("time_profile", ""),
+            "cluster_count": quality.get("cluster_count", 0),
+            "set_packing_topk": quality.get("set_packing_topk", 0),
+            "route_scope": quality.get("route_scope", 0),
             "compute_ms": quality.get("compute_ms"),
             "budget_ms": quality.get("budget_ms"),
             "fast_low_fuel": quality.get("fast_low_fuel"),
@@ -680,6 +754,8 @@ def main():
             "set_packing_states": quality.get("set_packing_states", 0),
             "set_packing_mode": quality.get("set_packing_mode", ""),
             "set_packing_feasible_states": quality.get("set_packing_feasible_states", 0),
+            "set_packing_exact_rescored": quality.get("set_packing_exact_rescored", 0),
+            "set_packing_feasible_exact_found": quality.get("set_packing_feasible_exact_found", 0),
             "set_packing_preservation_gap": quality.get("set_packing_preservation_gap", 0),
             "set_packing_simulated_exact": quality.get("set_packing_simulated_exact", 0),
             "set_packing_interrupted": quality.get("set_packing_interrupted", 0),
@@ -708,6 +784,8 @@ def main():
             f"oversweep_routes={quality.get('oversweep_routes', 0)} "
             f"selected_profile={quality.get('selected_profile', '')} "
             f"selected_reason={quality.get('selected_reason', '')} "
+            f"map_family={quality.get('map_family', '')} time_profile={quality.get('time_profile', '')} "
+            f"clusters={quality.get('cluster_count', '')} set_packing_topk={quality.get('set_packing_topk', '')} route_scope={quality.get('route_scope', '')} "
             f"selected_rollout_policy={quality.get('selected_rollout_policy', '')} "
             f"rollout_future_server={quality.get('selected_rollout_future_server', '')} "
             f"rollout_total_server={quality.get('selected_rollout_total_server', '')} "
@@ -735,6 +813,7 @@ def main():
             f"brand_max_reachable={quality.get('brand_max_reachable', '')} "
             f"set_packing_mode={quality.get('set_packing_mode', '')} "
             f"set_packing_states={quality.get('set_packing_states', '')} feasible_states={quality.get('set_packing_feasible_states', '')} "
+            f"exact_rescored={quality.get('set_packing_exact_rescored', '')} "
             f"set_packing_sim_exact={quality.get('set_packing_simulated_exact', '')} set_packing_gap={quality.get('set_packing_preservation_gap', '')} "
             f"rendezvous_exec={quality.get('rendezvous_executable', 0)}/{quality.get('rendezvous_candidates', 0)} "
             f"rollout_exact_brands={quality.get('rollout_exact_future_brand_days', '')} rollout_exact_portions={quality.get('rollout_exact_future_portions', '')} "
@@ -797,6 +876,8 @@ def main():
     )
     profile_counts = {}
     profile_compute = {}
+    map_family_counts = {}
+    time_profile_counts = {}
     selected_reasons = {}
     strong_rejected_count = 0
     strong_over_budget_days = []
@@ -831,6 +912,7 @@ def main():
     brand_constraint_loss_days = []
     set_packing_states_total = 0
     set_packing_feasible_states_total = 0
+    set_packing_exact_rescored_total = 0
     set_packing_mode_counts = {}
     set_packing_interrupted_days = []
     rendezvous_candidates_total = 0
@@ -844,6 +926,10 @@ def main():
         quality = stderr_quality.get(day, {})
         profile = quality.get("selected_profile") or ("fast_baseline" if quality.get("fast_only") else "unknown")
         profile_counts[profile] = profile_counts.get(profile, 0) + 1
+        family = quality.get("map_family") or "unknown"
+        time_profile = quality.get("time_profile") or "unknown"
+        map_family_counts[family] = map_family_counts.get(family, 0) + 1
+        time_profile_counts[time_profile] = time_profile_counts.get(time_profile, 0) + 1
         reason = quality.get("selected_reason")
         if reason:
             selected_reasons[reason] = selected_reasons.get(reason, 0) + 1
@@ -891,6 +977,7 @@ def main():
             brand_constraint_loss_days.append(row.get("day"))
         set_packing_states_total += row.get("set_packing_states", 0)
         set_packing_feasible_states_total += row.get("set_packing_feasible_states", 0)
+        set_packing_exact_rescored_total += row.get("set_packing_exact_rescored", 0)
         mode = row.get("set_packing_mode")
         if mode:
             set_packing_mode_counts[mode] = set_packing_mode_counts.get(mode, 0) + 1
@@ -913,6 +1000,8 @@ def main():
         if patrols and (row.get("low_fuel", 0) >= max(1, patrols - 1) or row.get("active", 0) <= max(1, patrols // 2)):
             fuel_collapse_days.append(row.get("day"))
     profile_counts_text = ",".join(f"{key}:{value}" for key, value in sorted(profile_counts.items()))
+    map_family_counts_text = ",".join(f"{key}:{value}" for key, value in sorted(map_family_counts.items()))
+    time_profile_counts_text = ",".join(f"{key}:{value}" for key, value in sorted(time_profile_counts.items()))
     selected_reasons_text = ",".join(f"{key}:{value}" for key, value in sorted(selected_reasons.items()))
     profile_compute_text = ",".join(
         f"{profile}:avg{int(sum(values) / len(values))}/max{max(values)}"
@@ -1006,7 +1095,15 @@ def main():
     min_margin = min(margins) if margins else 0
     min_state_margin = min(state_margins) if state_margins else 0
     min_submit_margin = min(submit_margins) if submit_margins else 0
-    transport_invalid = bool(missing_action_days or http_missing_days or day_jump_count or rate_invalid or leader_conflict or handover_storm)
+    action_response_invalid = bool(
+        invalid_action_response_days or
+        missing_action_response_days or
+        assignment_response_valid is False
+    )
+    transport_invalid = bool(
+        missing_action_days or http_missing_days or day_jump_count or
+        rate_invalid or leader_conflict or handover_storm or action_response_invalid
+    )
     deadline_invalid = bool(negative_margin_days or summary_deadline_invalid_days)
     match_classification = "farm_valid"
     if transport_invalid:
@@ -1040,6 +1137,9 @@ def main():
         f"reachable_capture_ratio={(int(100 * total / reachable_cap_est) if reachable_cap_est else 0)}% "
         f"top_missing_spots_total={top_missing_total_text} "
         f"missing_action_days={missing_action_days} http_missing_days={http_missing_days} "
+        f"missing_action_response_days={missing_action_response_days} "
+        f"invalid_action_response_days={invalid_action_response_days} "
+        f"assignment_response_valid={assignment_response_valid} "
         f"day_jump_count={day_jump_count} avg_bot_ms={avg_bot_ms} max_bot_ms={max_bot_ms} "
         f"setup_to_first_state_ms={setup_to_first_state_ms} "
         f"avg_state_ms={avg_state_ms} max_state_ms={max_state_ms} "
@@ -1053,6 +1153,7 @@ def main():
         f"handover_count={handover_count} timeout_count={timeout_count} "
         f"deadline_invalid={int(deadline_invalid)} match_classification={match_classification} "
         f"farm_benchmark_valid={int(farm_benchmark_valid)} "
+        f"map_family_counts={map_family_counts_text} time_profile_counts={time_profile_counts_text} "
         f"profile_counts={profile_counts_text} selected_reasons={selected_reasons_text} "
         f"profile_compute={profile_compute_text} "
         f"rollout_policy_counts={rollout_policy_counts_text} "
@@ -1061,6 +1162,7 @@ def main():
         f"brand_constraint_loss={brand_constraint_loss_days} "
         f"set_packing_states_total={set_packing_states_total} "
         f"set_packing_feasible_states_total={set_packing_feasible_states_total} "
+        f"set_packing_exact_rescored_total={set_packing_exact_rescored_total} "
         f"set_packing_modes={set_packing_mode_counts_text} "
         f"set_packing_interrupted_days={set_packing_interrupted_days} "
         f"rollout_exact_future_brand_days_total={rollout_exact_future_brand_days_total} "
@@ -1132,11 +1234,17 @@ def main():
             "top_gap": (top_row.get("udon_total") - chosen.get("udon_total")) if top_row and chosen else None,
             "transport_invalid": transport_invalid,
             "deadline_invalid": deadline_invalid,
+            "action_response_invalid": action_response_invalid,
+            "missing_action_response_days": missing_action_response_days,
+            "invalid_action_response_days": invalid_action_response_days,
+            "assignment_response_valid": assignment_response_valid,
             "match_classification": match_classification,
             "farm_benchmark_valid": farm_benchmark_valid,
             "avg_bot_ms": avg_bot_ms,
             "max_bot_ms": max_bot_ms,
             "profile_counts": profile_counts,
+            "map_family_counts": map_family_counts,
+            "time_profile_counts": time_profile_counts,
             "selected_reasons": selected_reasons,
             "setup_assignment_reason": setup_assignment_reason,
             "setup_ab_3day": setup_ab_3day,
@@ -1148,6 +1256,7 @@ def main():
             "road_wait_steps_total": road_wait_steps_total,
             "end_on_road_total": end_on_road_total,
             "route_signature_duplicates_total": route_signature_duplicates_total,
+            "set_packing_exact_rescored_total": set_packing_exact_rescored_total,
             "retry_count": retry_count_total,
             "cached_plan_returns": cached_plan_returns_total,
             "debt_duplicate_updates": debt_duplicate_updates_total,

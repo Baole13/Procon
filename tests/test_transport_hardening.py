@@ -5,7 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from run_cpp_http import BackoffPolicy, LeaderLock
+from run_cpp_http import BackoffPolicy, LeaderLock, accepted_response, safe_actions_for_state
 
 
 class TransportHardeningTest(unittest.TestCase):
@@ -39,6 +39,19 @@ class TransportHardeningTest(unittest.TestCase):
         finally:
             first.release()
             second.release()
+
+    def test_accepted_response_requires_positive_or_safe_implicit_result(self):
+        self.assertEqual(accepted_response({"valid": True})[0], True)
+        self.assertEqual(accepted_response({"accepted": False, "reason": "bad"})[0], False)
+        self.assertEqual(accepted_response({"status": "ok"})[0], True)
+        self.assertEqual(accepted_response({"status": "rejected"})[0], False)
+        self.assertEqual(accepted_response({"type": "action_result"})[0], True)
+        self.assertEqual(accepted_response({})[0], False)
+
+    def test_safe_actions_waits_exact_day_budget(self):
+        state = {"day": 1, "agents": [{"id": 0}, {"id": 1}, {"id": 2}]}
+        setup = {"daySteps": [40, 66]}
+        self.assertEqual(safe_actions_for_state(state, setup), [[-66], [-66], [-66]])
 
 
 if __name__ == "__main__":

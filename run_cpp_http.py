@@ -43,6 +43,43 @@ def append_replay(path, value):
         f.write(json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n")
 
 
+def accepted_response(payload):
+    """Return (accepted, reason, implicit) for assignment/action POST responses."""
+    if payload is None:
+        return False, "empty_response", False
+    if not isinstance(payload, dict):
+        return False, "non_object_response", False
+    for key in ("valid", "accepted", "ok", "success"):
+        if key in payload:
+            return bool(payload.get(key)), f"{key}={payload.get(key)}", False
+    status = str(payload.get("status", "")).lower()
+    if status in ("ok", "accepted", "success", "valid"):
+        return True, f"status={status}", False
+    if status in ("error", "invalid", "rejected", "failed", "failure"):
+        return False, f"status={status}", False
+    if "error" in payload:
+        return False, f"error={payload.get('error')}", False
+    if "reason" in payload and str(payload.get("reason", "")).strip():
+        return False, f"reason={payload.get('reason')}", False
+    response_type = str(payload.get("type", "")).lower()
+    if "result" in response_type or "accepted" in response_type or "action" in response_type or "assignment" in response_type:
+        return True, f"implicit_type={response_type}", True
+    return False, "missing_accept_flag", False
+
+
+def safe_actions_for_state(state, setup):
+    agents = state.get("agents", [])
+    day = state.get("day", 0)
+    day_steps = setup.get("daySteps", [])
+    budget = day_steps[day] if isinstance(day, int) and 0 <= day < len(day_steps) else state.get("daySteps", 0)
+    try:
+        budget = int(budget)
+    except Exception:
+        budget = 0
+    wait = -budget if budget > 0 else 0
+    return [[wait] if wait else [] for _ in agents]
+
+
 def parse_deadline_seconds(value):
     if value is None:
         return None
@@ -456,7 +493,7 @@ def main():
         if assignment_marker.exists():
             write_log(http_log, f"Assignment already submitted for match {args.match}; skip duplicate POST")
         elif is_leader:
-            call_with_retry(
+            assignment_response = call_with_retry(
                 client,
                 "POST",
                 "/assignment",
@@ -464,6 +501,11 @@ def main():
                 phase=transport_phase,
                 backoff=action_backoff,
             )
+            save_json(match_dir / "assignment-response.json", assignment_response)
+            accepted, reason, implicit = accepted_response(assignment_response)
+            write_log(http_log, f"ASSIGNMENT_RESULT accepted={int(accepted)} implicit_accept={int(implicit)} reason={reason} payload={json.dumps(assignment_response, ensure_ascii=False, separators=(',', ':'))}")
+            if not accepted:
+                raise RuntimeError(f"Assignment rejected: {reason}")
             assignment_marker.write_text(str(time.time()), encoding="ascii")
         assignment_submitted_at = time.perf_counter()
         write_log(http_log, f"Assignment submitted for match {args.match}")
@@ -540,8 +582,11 @@ def main():
                     actions_raw = read_bot_line(bot, f"day {day}", http_log)
                     (match_dir / f"day-{day}-actions.raw.json").write_text(actions_raw, encoding="utf-8")
                     post_started = time.perf_counter()
+                    action_response = None
+                    action_accepted = not is_leader
+                    action_reason = "observer"
                     if is_leader:
-                        call_with_retry(
+                        action_response = call_with_retry(
                             client,
                             "POST",
                             "/actions",
@@ -551,19 +596,44 @@ def main():
                             phase=HttpPhase.ACTIVE_DAY,
                             backoff=action_backoff,
                         )
+                        save_json(match_dir / f"day-{day}-action-response.json", action_response)
+                        action_accepted, action_reason, implicit_accept = accepted_response(action_response)
+                        write_log(http_log, f"ACTION_RESULT day={day} accepted={int(action_accepted)} implicit_accept={int(implicit_accept)} reason={action_reason} payload={json.dumps(action_response, ensure_ascii=False, separators=(',', ':'))}")
+                        if not action_accepted:
+                            write_log(http_log, f"ERROR action_rejected day={day} reason={action_reason}")
+                            safe_actions = safe_actions_for_state(state, setup)
+                            save_json(match_dir / f"day-{day}-safe-actions.raw.json", safe_actions)
+                            safe_response = call_with_retry(
+                                client,
+                                "POST",
+                                "/actions",
+                                safe_actions,
+                                retries=1,
+                                timeout=action_timeout,
+                                phase=HttpPhase.ACTIVE_DAY,
+                                backoff=action_backoff,
+                            )
+                            save_json(match_dir / f"day-{day}-safe-action-response.json", safe_response)
+                            safe_accepted, safe_reason, safe_implicit = accepted_response(safe_response)
+                            write_log(http_log, f"SAFE_ACTION_RESULT day={day} accepted={int(safe_accepted)} implicit_accept={int(safe_implicit)} reason={safe_reason} payload={json.dumps(safe_response, ensure_ascii=False, separators=(',', ':'))}")
+                            action_accepted = safe_accepted
+                            action_reason = safe_reason
+                            if not safe_accepted:
+                                raise RuntimeError(f"Actions rejected and safe fallback rejected for day {day}: {safe_reason}")
                     post_ms = int((time.perf_counter() - post_started) * 1000)
                     post_samples_ms.append(post_ms)
                     if len(post_samples_ms) > 20:
                         post_samples_ms.pop(0)
                     current_day = day
-                    submitted_days.add(day)
+                    if action_accepted:
+                        submitted_days.add(day)
                     if ends_at:
                         margin_after_post_ms, _mode_after_post = deadline_meta(ends_at, time.time())
                         if margin_after_post_ms is not None and margin_after_post_ms < 0:
                             deadline_invalid_days.add(day)
-                        write_log(http_log, f"Submitted day {day} post_ms={post_ms} submit_deadline_margin_ms={margin_after_post_ms}")
+                        write_log(http_log, f"Submitted day {day} accepted={int(action_accepted)} reason={action_reason} post_ms={post_ms} submit_deadline_margin_ms={margin_after_post_ms}")
                     else:
-                        write_log(http_log, f"Submitted day {day} post_ms={post_ms}")
+                        write_log(http_log, f"Submitted day {day} accepted={int(action_accepted)} reason={action_reason} post_ms={post_ms}")
                     transport_phase = HttpPhase.AFTER_VALID_ACTION
             except Exception as exc:
                 state_errors += 1
@@ -574,12 +644,19 @@ def main():
                         raise
                     error_delay = delay
                     write_log(http_log, f"backoff phase={transport_phase.value} method=GET path=/state code={exc.code} reason={reason} backoff_ms={int(error_delay * 1000)}")
+                    if exc.code == 425 and current_day < 0:
+                        state_errors = 0
+                        time.sleep(error_delay)
+                        handled_new_day = True
+                        continue
                 else:
                     delay, reason = state_backoff.delay_for_timeout()
                     error_delay = delay
                     write_log(http_log, f"backoff phase={transport_phase.value} method=GET path=/state code=ERR reason={reason} backoff_ms={int(error_delay * 1000)}")
                 now = time.perf_counter()
-                if state_errors >= 4 and now - last_result_probe_at >= 1.0:
+                expected_days_for_probe = len(setup.get("daySteps", []))
+                after_expected_days = expected_days_for_probe > 0 and current_day >= expected_days_for_probe - 1
+                if after_expected_days and state_errors >= 4 and now - last_result_probe_at >= 1.0:
                     last_result_probe_at = now
                     try:
                         result = client.call("GET", "/result", phase=HttpPhase.FINISHED)
