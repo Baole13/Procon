@@ -400,6 +400,9 @@ struct PlannerConfig {
     int clusterQuotaStrictness = 1;
     int clusterCount = 1;
     int setPackingTopK = 64;
+    int setPackingStateCap = 5000;
+    int exactReserveMs = 40;
+    int minExactRescore = 16;
     int routeScope = 0;
     int terminalWeight = 1;
 };
@@ -544,6 +547,9 @@ static PlannerConfig makePlannerConfig(const vector<Agent>& agents) {
     cfg.clusterCount = 1;
     cfg.routeScope = 0;
     cfg.setPackingTopK = 64;
+    cfg.setPackingStateCap = 5000;
+    cfg.exactReserveMs = max(28, cfg.computeBudgetMs / 5);
+    cfg.minExactRescore = 16;
     cfg.terminalWeight = 1;
     if (small8) {
         cfg.beamWidth = max(cfg.beamWidth, 52);
@@ -553,6 +559,8 @@ static PlannerConfig makePlannerConfig(const vector<Agent>& agents) {
         cfg.maxVisits = max(cfg.maxVisits, min(12, max(5, cfg.dayBudget / 5)));
         cfg.clusterCount = 1;
         cfg.setPackingTopK = 256;
+        cfg.setPackingStateCap = 9000;
+        cfg.minExactRescore = 64;
         cfg.computeBudgetMs = max(cfg.computeBudgetMs, 260);
     } else if (small12) {
         cfg.beamWidth = max(cfg.beamWidth, 58);
@@ -562,6 +570,8 @@ static PlannerConfig makePlannerConfig(const vector<Agent>& agents) {
         cfg.maxVisits = max(cfg.maxVisits, min(11, max(6, cfg.dayBudget / 7)));
         cfg.clusterCount = max(1, min((int)G.spots.size(), max(2, cfg.patrols / 2)));
         cfg.setPackingTopK = 128;
+        cfg.setPackingStateCap = 7000;
+        cfg.minExactRescore = 32;
     } else if (medium16) {
         cfg.beamWidth = max(cfg.beamWidth, 62);
         cfg.poolLimit = max(cfg.poolLimit, 12);
@@ -570,6 +580,8 @@ static PlannerConfig makePlannerConfig(const vector<Agent>& agents) {
         cfg.maxVisits = max(cfg.maxVisits, min(10, max(5, cfg.dayBudget / 8)));
         cfg.clusterCount = max(2, min((int)G.spots.size(), max(2, cfg.patrols / 2)));
         cfg.setPackingTopK = 128;
+        cfg.setPackingStateCap = 6000;
+        cfg.minExactRescore = 48;
         cfg.terminalWeight = 2;
     } else if (large24) {
         cfg.clusterCount = max(3, min(5, min((int)G.spots.size(), max(3, cfg.patrols / 2))));
@@ -580,6 +592,8 @@ static PlannerConfig makePlannerConfig(const vector<Agent>& agents) {
         cfg.heavyTargetLimit = max(cfg.heavyTargetLimit, min((int)G.spots.size(), cfg.clusterCount + 4));
         cfg.maxVisits = min(max(cfg.maxVisits, 7), 11);
         cfg.setPackingTopK = 128;
+        cfg.setPackingStateCap = 7000;
+        cfg.minExactRescore = 48;
         cfg.terminalWeight = 3;
     } else {
         cfg.clusterCount = max(4, min(6, min((int)G.spots.size(), max(4, cfg.patrols / 2 + 1))));
@@ -590,15 +604,22 @@ static PlannerConfig makePlannerConfig(const vector<Agent>& agents) {
         cfg.heavyTargetLimit = max(cfg.heavyTargetLimit, min((int)G.spots.size(), cfg.clusterCount + 4));
         cfg.maxVisits = min(max(cfg.maxVisits, 6), 9);
         cfg.setPackingTopK = 128;
+        cfg.setPackingStateCap = 5500;
+        cfg.minExactRescore = 64;
         cfg.terminalWeight = 4;
     }
 
     if (cfg.timeProfile == TimeProfile::Fast) {
         cfg.setPackingTopK = small8 ? 96 : (large ? 48 : 64);
+        cfg.setPackingStateCap = min(cfg.setPackingStateCap, large ? 2500 : 3500);
+        cfg.minExactRescore = min(cfg.minExactRescore, 16);
     } else if (cfg.timeProfile == TimeProfile::Normal) {
         cfg.setPackingTopK = small8 ? 256 : (large ? 160 : 128);
+        cfg.setPackingStateCap = min(cfg.setPackingStateCap, large ? 5000 : 5500);
     } else {
-        cfg.setPackingTopK = small8 ? 512 : (large ? 512 : 384);
+        if (medium16) cfg.setPackingTopK = 160;
+        else if (cfg.mapFamily == MapFamily::XL32) cfg.setPackingTopK = 192;
+        else cfg.setPackingTopK = small8 ? 512 : (large ? 192 : 256);
     }
 
     if (cfg.dayBudget < cfg.medianDaySteps) {
@@ -678,7 +699,8 @@ static PlannerConfig makePlannerConfig(const vector<Agent>& agents) {
          G.hardBudgetMs >= 1000);
     if (deepTimeAvailable) {
         int extraBudget = G.hardBudgetMs > 0 ? G.hardBudgetMs : max(0, G.deadlineMarginMs - 450);
-        int deepCap = cfg.timeProfile == TimeProfile::Long ? (large ? 4500 : 3000) : (large ? 1800 : 1200);
+        int deepCap = cfg.timeProfile == TimeProfile::Long ? (large ? 4500 : 3000) :
+            (large ? (maxLarge ? 3300 : 3000) : (medium16 ? 2400 : 2200));
         cfg.computeBudgetMs = max(cfg.computeBudgetMs, min(deepCap, max(350, extraBudget)));
         if (cfg.timeProfile == TimeProfile::Long) {
             cfg.beamWidth += large ? 24 : 16;
@@ -705,7 +727,7 @@ static PlannerConfig makePlannerConfig(const vector<Agent>& agents) {
     if (G.hardBudgetMs > 0) {
         int hardBudget = max(10, G.hardBudgetMs);
         int stableBenchmarkBudget = cfg.timeProfile == TimeProfile::Long ? (large ? 4500 : (medium16 ? 3000 : 2200)) :
-            (large ? 1600 : (medium16 ? 1800 : 1000));
+            (large ? (maxLarge ? 3300 : 3000) : (medium16 ? 2400 : 1600));
         cfg.computeBudgetMs = min(hardBudget, stableBenchmarkBudget);
     }
     int daysAfterToday = max(0, (int)G.daySteps.size() - G.day - 1);
@@ -716,6 +738,10 @@ static PlannerConfig makePlannerConfig(const vector<Agent>& agents) {
     if (medium16) {
         cfg.futureFuelLambda = max(cfg.futureFuelLambda, 2);
         cfg.clusterQuotaStrictness = max(cfg.clusterQuotaStrictness, 2);
+        if (G.day == 0 && cfg.fuelRatio > 0.85) {
+            cfg.futureFuelLambda = 1;
+            cfg.minEndFuelReserve = max(LOW_FUEL_ROUTE_LIMIT, G.fuelLimit / 6);
+        }
         if (cfg.timeProfile != TimeProfile::Fast && daysAfterToday >= 2 && cfg.fuelRatio < 0.75) {
             cfg.futureFuelLambda = max(cfg.futureFuelLambda, 3);
             cfg.minEndFuelReserve = max(cfg.minEndFuelReserve, max(LOW_FUEL_ROUTE_LIMIT, G.fuelLimit / 3));
@@ -725,7 +751,7 @@ static PlannerConfig makePlannerConfig(const vector<Agent>& agents) {
         cfg.clusterQuotaStrictness = max(cfg.clusterQuotaStrictness, 3);
         if (G.day == 0 && cfg.fuelRatio > 0.80) {
             cfg.futureFuelLambda = max(1, cfg.futureFuelLambda - 1);
-            cfg.minEndFuelReserve = max(LOW_FUEL_ROUTE_LIMIT, G.fuelLimit / 5);
+            cfg.minEndFuelReserve = max(LOW_FUEL_ROUTE_LIMIT, G.fuelLimit / 6);
         }
     } else if (maxLarge) {
         cfg.futureFuelLambda = max(cfg.futureFuelLambda, 4);
@@ -733,11 +759,22 @@ static PlannerConfig makePlannerConfig(const vector<Agent>& agents) {
     }
     if (cfg.timeProfile == TimeProfile::Fast) {
         cfg.setPackingTopK = min(cfg.setPackingTopK, large ? 64 : (small8 ? 96 : 64));
+        cfg.setPackingStateCap = min(cfg.setPackingStateCap, large ? 2500 : 3500);
     } else if (cfg.timeProfile == TimeProfile::Normal) {
         cfg.setPackingTopK = max(cfg.setPackingTopK, large ? 160 : (small8 ? 256 : 128));
+        if (medium16) cfg.setPackingTopK = min(cfg.setPackingTopK, 160);
+        if (maxLarge) cfg.setPackingTopK = min(cfg.setPackingTopK, 192);
     } else {
-        cfg.setPackingTopK = max(cfg.setPackingTopK, large ? 512 : (small8 ? 512 : 384));
+        if (medium16) cfg.setPackingTopK = min(max(cfg.setPackingTopK, 128), 160);
+        else if (maxLarge) cfg.setPackingTopK = min(max(cfg.setPackingTopK, 128), 192);
+        else cfg.setPackingTopK = max(cfg.setPackingTopK, large ? 192 : (small8 ? 512 : 256));
     }
+    cfg.exactReserveMs = max(cfg.computeBudgetMs / 5, cfg.timeProfile == TimeProfile::Fast ? 18 : 60);
+    if (medium16) cfg.exactReserveMs = max(cfg.exactReserveMs, 220);
+    if (maxLarge) cfg.exactReserveMs = max(cfg.exactReserveMs, 350);
+    if (large24) cfg.exactReserveMs = max(cfg.exactReserveMs, 300);
+    cfg.setPackingStateCap = max(1200, min(cfg.setPackingStateCap, cfg.timeProfile == TimeProfile::Fast ? 3500 : 9000));
+    cfg.minExactRescore = max(8, min(cfg.minExactRescore, cfg.setPackingTopK));
     cfg.deadlineReserveMs = cfg.computeBudgetMs <= 60 ? 3 : 8;
     return cfg;
 }
@@ -810,6 +847,11 @@ static bool plannerTimeExceeded(int reserveMs = 0) {
     if (DEADLINE_ACTIVE) return ACTIVE_DEADLINE.expired(reserveMs);
     int budget = plannerBudgetMs();
     return budget > 0 && plannerElapsedMs() + reserveMs >= budget;
+}
+
+static bool setPackingTimeExceeded() {
+    int reserve = max(CURRENT_CONFIG.exactReserveMs, CURRENT_CONFIG.deadlineReserveMs);
+    return plannerTimeExceeded(reserve);
 }
 
 static int adaptiveBeamWidth(int dayBudget) {
@@ -2301,11 +2343,13 @@ static bool exactScoreBetter(const ExactScore& a, const ExactScore& b) {
     bool bHardOk = b.hardSlack >= 0 && b.robustSlack >= 0;
     if (aHardOk != bHardOk) return aHardOk;
     if (a.failedRefuels != b.failedRefuels) return a.failedRefuels < b.failedRefuels;
+    if (a.serverEst != b.serverEst) return a.serverEst > b.serverEst;
     if (a.actualPortions != b.actualPortions) return a.actualPortions > b.actualPortions;
+    if (a.ghostStock != b.ghostStock) return a.ghostStock < b.ghostStock;
     if (a.fuelRisk != b.fuelRisk) return a.fuelRisk < b.fuelRisk;
     if (a.roadRisk != b.roadRisk) return a.roadRisk < b.roadRisk;
     if (a.terminalValue != b.terminalValue) return a.terminalValue > b.terminalValue;
-    return a.serverEst > b.serverEst;
+    return a.effectiveCaptureRatio > b.effectiveCaptureRatio;
 }
 
 static bool exactScoreStrictlyBetter(const ExactScore& a, const ExactScore& b) {
@@ -2330,8 +2374,10 @@ static bool exactScoreClearlyWorse(const ExactScore& candidate, const ExactScore
     if (candidate.globalBrands > baseline.globalBrands) return false;
     if (candidate.dailyBrands < baseline.dailyBrands) return true;
     if (candidate.dailyBrands > baseline.dailyBrands) return false;
-    if (candidate.actualPortions + 1 < baseline.actualPortions) return true;
-    if (candidate.serverEst + 2 < baseline.serverEst) return true;
+    if (candidate.serverEst < baseline.serverEst) return true;
+    if (candidate.serverEst > baseline.serverEst) return false;
+    if (candidate.actualPortions < baseline.actualPortions) return true;
+    if (candidate.ghostStock > baseline.ghostStock + 1) return true;
     return false;
 }
 
@@ -3154,13 +3200,16 @@ static vector<vector<RouteCandidate>> generateRoutePools(const vector<Agent>& ag
         if (bestDist >= INF) continue;
         int stock = max(1, G.spots[sid].amount);
         bool xl32 = CURRENT_CONFIG.mapFamily == MapFamily::XL32;
+        int quota = desiredQuotaForSpot((int)sid);
+        int value = 260 * stock + 180 * spotDebt((int)sid) + 220 * quota;
+        int marginal = value * 100 / max(1, bestDist);
         int score =
             180 * stock +
             120 * spotDebt((int)sid) +
-            (xl32 ? 260 : 1) * bestDist +
+            (xl32 ? marginal : bestDist) +
             (stock >= 3 ? 350 : 0) +
-            (isLargeMap() && bestDist > dayBudget / 3 ? (xl32 ? 900 : 180) : 0) +
-            (xl32 ? 240 * desiredQuotaForSpot((int)sid) : 0);
+            (isLargeMap() && bestDist > dayBudget / 3 ? (xl32 ? 120 : 180) : 0) +
+            (xl32 ? 240 * quota - 12 * bestDist : 0);
         remoteTargets.push_back({score, (int)sid});
     }
     sort(remoteTargets.rbegin(), remoteTargets.rend());
@@ -3290,6 +3339,7 @@ struct MarginalEval {
     int terminalValue = 0;
     int futureFuelDebt = 0;
     int roadPenalty = 0;
+    int ghostOverflow = 0;
     long long rank = -1;
 };
 
@@ -3307,7 +3357,10 @@ static MarginalEval evaluateCandidate(
     set<int> routeClusters;
     for (int sid : candidate.route.visitedSpots) {
         if (sid < 0 || sid >= (int)G.spots.size()) continue;
-        if (rem[sid] <= 0) continue;
+        if (rem[sid] <= 0) {
+            eval.ghostOverflow++;
+            continue;
+        }
         int beforeDeficit = sid < (int)deficits.size() ? deficits[sid] : 0;
         rem[sid]--;
         eval.portions++;
@@ -3327,6 +3380,7 @@ static MarginalEval evaluateCandidate(
         eval.roadPenalty += 1 + plannedRoadUse[src];
     }
     eval.roadPenalty += 3 * candidate.waitOnRoadRisk;
+    eval.roadPenalty += eval.ghostOverflow * (CURRENT_CONFIG.mapFamily == MapFamily::S12 ? 80 : (CURRENT_CONFIG.mapFamily == MapFamily::XL32 ? 32 : 12));
     if (candidate.endOnRoad && G.day + 1 < (int)G.daySteps.size()) eval.roadPenalty += max(2, dayBudget / 12);
     eval.slack = dayBudget - conservativeSteps(candidate.route, plannedRoadUse);
     eval.fuelLeft = candidate.route.fuelLeft;
@@ -3368,6 +3422,7 @@ static MarginalEval evaluateCandidate(
         20LL * eval.fuelLeft +
         15LL * eval.terminalValue -
         15000LL * eval.futureFuelDebt -
+        (CURRENT_CONFIG.mapFamily == MapFamily::S12 ? 2500000LL : (CURRENT_CONFIG.mapFamily == MapFamily::XL32 ? 350000LL : 90000LL)) * eval.ghostOverflow -
         ((isLargeMap() && G.day + 1 < (int)G.daySteps.size()) ? 18000LL : 5000LL) * eval.fuelRisk * max(1, CURRENT_CONFIG.futureFuelLambda) -
         ((G.daySeconds > 0 && G.daySeconds <= 2) ? 2200LL : 1500LL) * eval.roadPenalty -
         5000LL * max(0, requiredSlack(dayBudget) - eval.slack);
@@ -3416,11 +3471,15 @@ static vector<Route> combineRoutesStockAware(const vector<Agent>& agents, const 
     vector<BeamState> beam(1, initial);
     vector<int> patrolIds;
     for (const Agent& agent : agents) if (agent.kind == 0) patrolIds.push_back(agent.id);
-    sort(patrolIds.begin(), patrolIds.end(), [&](int a, int b) {
-        int besta = pools[a].empty() ? -INF : pools[a][0].conservativeScore;
-        int bestb = pools[b].empty() ? -INF : pools[b][0].conservativeScore;
-        return besta > bestb;
-    });
+    if (CURRENT_CONFIG.mapFamily == MapFamily::S12 || CURRENT_CONFIG.mapFamily == MapFamily::XL32) {
+        sort(patrolIds.begin(), patrolIds.end());
+    } else {
+        sort(patrolIds.begin(), patrolIds.end(), [&](int a, int b) {
+            int besta = pools[a].empty() ? -INF : pools[a][0].conservativeScore;
+            int bestb = pools[b].empty() ? -INF : pools[b][0].conservativeScore;
+            return besta > bestb;
+        });
+    }
 
     int beamWidth = adaptiveBeamWidth(dayBudget);
     for (int agentId : patrolIds) {
@@ -3604,7 +3663,7 @@ static vector<Route> combineRoutesStockAware(const vector<Agent>& agents, const 
         candidatePlan = normalizePlan(candidatePlan, agents, dayBudget);
         return evaluatePlanForSelection(candidatePlan, agents, dayBudget);
     };
-    if ((int)patrolIds.size() <= 8 && (int)G.spots.size() <= 12 && !plannerTimeExceeded(max(8, plannerBudgetMs() / 6))) {
+    if ((int)patrolIds.size() <= 8 && (int)G.spots.size() <= 12 && !setPackingTimeExceeded()) {
         BeamState dfsBest = best;
         BeamState dfsFeasibleBest = best;
         PlanEval dfsFeasibleEval;
@@ -3653,7 +3712,7 @@ static vector<Route> combineRoutesStockAware(const vector<Agent>& agents, const 
             topLeaves.swap(diverse);
         };
         function<void(int)> dfs = [&](int idx) {
-            if (setPackingStates >= 12000 || plannerTimeExceeded(4)) {
+            if (setPackingStates >= CURRENT_CONFIG.setPackingStateCap || setPackingTimeExceeded()) {
                 setPackingInterrupted = true;
                 return;
             }
@@ -3708,7 +3767,7 @@ static vector<Route> combineRoutesStockAware(const vector<Agent>& agents, const 
         dfs(0);
         int exactRescored = 0;
         for (const BeamState& leaf : topLeaves) {
-            if (exactRescored >= exactRescoreLimit || plannerTimeExceeded(3)) break;
+            if (exactRescored >= exactRescoreLimit || plannerTimeExceeded(CURRENT_CONFIG.deadlineReserveMs)) break;
             PlanEval simulated = evalTeamState(leaf);
             exactRescored++;
             if (simulated.negativeSlackFinal != 0) continue;
@@ -3723,19 +3782,25 @@ static vector<Route> combineRoutesStockAware(const vector<Agent>& agents, const 
                 dfsFoundFeasible = true;
             }
         }
+        bool exactConfidence = exactRescored >= min(CURRENT_CONFIG.minExactRescore, max(1, (int)topLeaves.size())) ||
+            dfsFoundFeasible;
         if (!SUPPRESS_PLAN_LOGS) {
             cerr << "set_packing_topk day=" << G.day
                  << " leaves=" << topLeaves.size()
                  << " exact_rescore_limit=" << exactRescoreLimit
                  << " exact_rescored=" << exactRescored
                  << " feasible_exact_found=" << (dfsFoundFeasible ? 1 : 0)
+                 << " min_exact_rescore=" << CURRENT_CONFIG.minExactRescore
+                 << " exact_confidence=" << (exactConfidence ? 1 : 0)
                  << "\n";
         }
-        teamStateCandidates.push_back(dfsBest);
-        if (betterTeamState(dfsBest, best)) {
+        if (exactConfidence) teamStateCandidates.push_back(dfsBest);
+        if (exactConfidence && betterTeamState(dfsBest, best)) {
             best = std::move(dfsBest);
             setPackingMode = "exact_set_packing";
             if (!SUPPRESS_PLAN_LOGS) cerr << "combiner day=" << G.day << " selected=set_packing\n";
+        } else if (!exactConfidence && dfsFoundFeasible) {
+            teamStateCandidates.push_back(dfsFeasibleBest);
         }
         PlanEval currentBestEval = evalTeamState(best);
         if (currentBestEval.negativeSlackFinal > 0 && dfsFoundFeasible &&
@@ -3831,6 +3896,7 @@ static vector<Route> combineRoutesStockAware(const vector<Agent>& agents, const 
              << " states=" << setPackingStates
              << " expanded_states=" << setPackingStates
              << " feasible_complete_states=" << setPackingFeasibleStates
+             << " state_cap=" << CURRENT_CONFIG.setPackingStateCap
              << " selected_exact=" << evalTeamState(best).cappedPortions
              << " selected_brands=" << evalTeamState(best).dailyBrands
              << " interrupted=" << (setPackingInterrupted ? 1 : 0)
@@ -4758,6 +4824,96 @@ static vector<vector<int>> repairLastPortions(
     return bestPlan;
 }
 
+static vector<vector<int>> trimGhostTailsByOwnership(
+    const vector<vector<int>>& inputPlan,
+    const vector<Agent>& agents,
+    int dayBudget
+) {
+    vector<vector<int>> bestPlan = normalizePlan(inputPlan, agents, dayBudget);
+    if (!validatePlan(bestPlan, agents, dayBudget)) return inputPlan;
+    ExactScore bestExact = exactScoreForPlan(bestPlan, agents, dayBudget);
+    if (!bestExact.valid || bestExact.ghostStock <= 0) return bestPlan;
+
+    TeamSimulation team = simulateTeamPlan(bestPlan, agents, dayBudget);
+    if (!team.valid) return bestPlan;
+    vector<int> remainingStock(G.spots.size(), 0);
+    for (size_t sid = 0; sid < G.spots.size(); ++sid) remainingStock[sid] = max(1, G.spots[sid].amount);
+
+    vector<int> lastUsefulStep(agents.size(), -1);
+    for (const Agent& agent : agents) {
+        if (agent.kind != 0 || agent.id >= (int)team.routes.size()) continue;
+        const Route& route = team.routes[agent.id];
+        for (const auto& visit : route.visitTimeline) {
+            int sid = visit.second;
+            if (sid < 0 || sid >= (int)remainingStock.size()) continue;
+            if (remainingStock[sid] <= 0) continue;
+            remainingStock[sid]--;
+            lastUsefulStep[agent.id] = max(lastUsefulStep[agent.id], visit.first);
+        }
+    }
+
+    vector<vector<int>> candidate = bestPlan;
+    bool changed = false;
+    for (const Agent& agent : agents) {
+        if (agent.kind != 0 || agent.id >= (int)candidate.size()) continue;
+        int cutoff = lastUsefulStep[agent.id];
+        if (cutoff < 0) {
+            if (!candidate[agent.id].empty()) {
+                candidate[agent.id].clear();
+                changed = true;
+            }
+            continue;
+        }
+        int used = 0;
+        int cur = agent.pos;
+        vector<int> trimmed;
+        for (int action : bestPlan[agent.id]) {
+            if (action < 0) break;
+            if (action >= 6) break;
+            MoveCost cost = moveCost(cur);
+            int nxt = neighbor(cur, action);
+            if (nxt < 0 || !cost.passable) break;
+            if (used + cost.steps > cutoff) break;
+            trimmed.push_back(action);
+            used += cost.steps;
+            cur = nxt;
+        }
+        if (trimmed.size() < candidate[agent.id].size()) {
+            candidate[agent.id] = std::move(trimmed);
+            changed = true;
+        }
+    }
+    if (!changed) return bestPlan;
+    candidate = normalizePlan(candidate, agents, dayBudget);
+    if (!validatePlan(candidate, agents, dayBudget)) return bestPlan;
+    candidate = makeFeasibleFinalPlan(candidate, agents, dayBudget);
+    ExactScore candidateExact = exactScoreForPlan(candidate, agents, dayBudget);
+    if (!candidateExact.valid) return bestPlan;
+    bool keepsScore =
+        candidateExact.globalBrands >= bestExact.globalBrands &&
+        candidateExact.dailyBrands >= bestExact.dailyBrands &&
+        candidateExact.serverEst >= bestExact.serverEst &&
+        candidateExact.actualPortions >= bestExact.actualPortions &&
+        candidateExact.hardSlack >= 0 &&
+        candidateExact.robustSlack >= 0 &&
+        candidateExact.failedRefuels <= bestExact.failedRefuels;
+    if (!keepsScore || candidateExact.ghostStock >= bestExact.ghostStock) return bestPlan;
+    if (!SUPPRESS_PLAN_LOGS) {
+        cerr << "ghost_tail_trim day=" << G.day
+             << " old_ghost=" << bestExact.ghostStock
+             << " ghost_stock=" << candidateExact.ghostStock
+             << " server=" << candidateExact.serverEst
+             << " portions=" << candidateExact.actualPortions
+             << "\n";
+        cerr << "anytime_repair day=" << G.day
+             << " type=ghost_tail_trim accepted=1"
+             << " exact_delta=0"
+             << " server=" << candidateExact.serverEst
+             << "\n";
+    }
+    return candidate;
+}
+
 static vector<vector<int>> ghostReassignRepair(
     const vector<vector<int>>& inputPlan,
     const vector<Agent>& agents,
@@ -4894,6 +5050,11 @@ static vector<vector<int>> finalizePlanForOutput(
         }
     }
 
+    if (eval.negativeSlackFinal == 0 && eval.ghostVisits > 0 && !plannerTimeExceeded(isLargeMap() ? 36 : 24)) {
+        plan = trimGhostTailsByOwnership(plan, agents, dayBudget);
+        eval = evaluatePlanForSelection(plan, agents, dayBudget);
+    }
+
     if (eval.negativeSlackFinal == 0 && eval.ghostVisits > 0 && !plannerTimeExceeded(isLargeMap() ? 28 : 18)) {
         plan = ghostReassignRepair(plan, agents, dayBudget);
         eval = evaluatePlanForSelection(plan, agents, dayBudget);
@@ -4967,6 +5128,9 @@ static vector<vector<int>> finalizePlanForOutput(
          << " heavy=" << CURRENT_CONFIG.heavyTargetLimit
          << " cluster_count=" << CURRENT_CONFIG.clusterCount
          << " set_packing_topk=" << CURRENT_CONFIG.setPackingTopK
+         << " set_packing_state_cap=" << CURRENT_CONFIG.setPackingStateCap
+         << " exact_reserve_ms=" << CURRENT_CONFIG.exactReserveMs
+         << " min_exact_rescore=" << CURRENT_CONFIG.minExactRescore
          << " route_scope=" << CURRENT_CONFIG.routeScope
          << " min_slack=" << CURRENT_CONFIG.minSlack
          << " max_visits=" << CURRENT_CONFIG.maxVisits
@@ -5366,6 +5530,8 @@ static bool rolloutCandidateBetter(const RolloutPlanCandidate& candidate, const 
     if (candidateHardOk != incumbentHardOk) return candidateHardOk;
     if (candidate.exact.globalBrands != incumbent.exact.globalBrands) return candidate.exact.globalBrands > incumbent.exact.globalBrands;
     if (candidate.exact.dailyBrands != incumbent.exact.dailyBrands) return candidate.exact.dailyBrands > incumbent.exact.dailyBrands;
+    if (exactScoreClearlyWorse(candidate.exact, incumbent.exact)) return false;
+    if (candidate.exact.serverEst > incumbent.exact.serverEst) return true;
     int cap = max(1, stockCap());
     int currentLoss = incumbent.eval.serverEst - candidate.eval.serverEst;
     int rolloutGain = candidate.rollout.totalServerEst - incumbent.rollout.totalServerEst;
@@ -5489,6 +5655,9 @@ static vector<vector<int>> planDay(const vector<Agent>& agents) {
          << " heavy=" << CURRENT_CONFIG.heavyTargetLimit
          << " cluster_count=" << CURRENT_CONFIG.clusterCount
          << " set_packing_topk=" << CURRENT_CONFIG.setPackingTopK
+         << " set_packing_state_cap=" << CURRENT_CONFIG.setPackingStateCap
+         << " exact_reserve_ms=" << CURRENT_CONFIG.exactReserveMs
+         << " min_exact_rescore=" << CURRENT_CONFIG.minExactRescore
          << " route_scope=" << CURRENT_CONFIG.routeScope
          << " min_slack=" << CURRENT_CONFIG.minSlack
          << " max_visits=" << CURRENT_CONFIG.maxVisits
@@ -5770,8 +5939,16 @@ static vector<vector<int>> planDay(const vector<Agent>& agents) {
     selectedReason = "rollout_" + string(fuelPolicyName(bestRollout.policy));
     PlanEval selectedEval = bestRollout.eval;
     ExactScore selectedExactAfterRollout = exactScoreForPlan(selectedPlan, agents, dayBudget);
+    ExactScore fastExactAfterRollout = fastCandidate.exact;
+    if (exactScoreClearlyWorse(selectedExactAfterRollout, fastExactAfterRollout)) {
+        selectedPlan = fastCandidate.plan;
+        selectedPlanName = "fast_baseline";
+        selectedReason = "anytime_exact_restore";
+        selectedEval = fastCandidate.eval;
+        selectedExactAfterRollout = fastExactAfterRollout;
+    }
     if (!meetsBrandConstraint(selectedExactAfterRollout, brandReach)) {
-        ExactScore fastExact = exactScoreForPlan(fastPlan, agents, dayBudget);
+        ExactScore fastExact = fastExactAfterRollout;
         ExactScore strongExact = exactScoreForPlan(strongPlan, agents, dayBudget);
         if (meetsBrandConstraint(strongExact, brandReach) &&
             (!meetsBrandConstraint(fastExact, brandReach) || exactScoreBetter(strongExact, fastExact))) {
